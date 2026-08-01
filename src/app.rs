@@ -1,9 +1,11 @@
-//! Main window: vidya chrome, session tabs, embedded agent terminals.
+//! Main window: vidya chrome, session sidebar, embedded agent terminals.
 
 use crate::session::{list_saved_chats, AgentSession, NewSessionDraft, SavedChat};
+use crate::subagents::SubagentStatus;
 use egui_term::{BackendCommand, ColorPalette, PtyEvent, TerminalTheme, TerminalView};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 use vidya::Theme;
 
 struct ResumeDialog {
@@ -102,6 +104,7 @@ pub struct App {
     rename_dialog: Option<RenameDialog>,
     spawn_error: Option<String>,
     term_theme: TerminalTheme,
+    last_subagent_poll: Instant,
 }
 
 impl App {
@@ -119,6 +122,9 @@ impl App {
             rename_dialog: None,
             spawn_error: None,
             term_theme: vidya_term_theme(),
+            last_subagent_poll: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
         }
     }
 
@@ -148,6 +154,23 @@ impl App {
                 }
                 _ => {}
             }
+        }
+    }
+
+    fn poll_subagents(&mut self, ctx: &egui::Context) {
+        if self.last_subagent_poll.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        self.last_subagent_poll = Instant::now();
+
+        let mut changed = false;
+        for session in self.sessions.values_mut() {
+            if session.poll_chat_state() {
+                changed = true;
+            }
+        }
+        if changed || self.sessions.values().any(|s| s.alive) {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
@@ -235,75 +258,179 @@ impl App {
         }
     }
 
-    fn show_tabs(&mut self, ctx: &egui::Context) {
-        if self.sessions.is_empty() {
-            return;
-        }
-
+    fn show_sidebar(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let ids: Vec<u64> = self.sessions.keys().copied().collect();
         let mut select: Option<u64> = None;
         let mut auto_rename: Option<u64> = None;
         let mut open_rename: Option<u64> = None;
 
-        egui::TopBottomPanel::top("session_tabs")
+        egui::SidePanel::left("agents")
+            .resizable(true)
+            .default_width(260.0)
+            .width_range(200.0..=400.0)
             .frame(
                 egui::Frame::NONE
                     .fill(theme.palette.view_bg)
-                    .inner_margin(egui::Margin::symmetric(12, 6)),
+                    .stroke(egui::Stroke::new(1.0, theme.palette.border_soft))
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show_separator_line(false)
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for id in ids {
-                        let (title, alive) = self
-                            .sessions
-                            .get(&id)
-                            .map(|s| (s.title.clone(), s.alive))
-                            .unwrap_or_else(|| ("?".into(), false));
-                        let active = self.active == Some(id);
-                        let label = if alive {
-                            title
-                        } else {
-                            format!("○ {title}")
-                        };
+                vidya::title_2(ui, &theme, "Agents");
+                ui.add_space(theme.spacing.sm);
 
-                        let text = egui::RichText::new(label)
-                            .size(theme.type_scale.body)
-                            .color(if active {
+                if ids.is_empty() {
+                    vidya::dim_label(ui, &theme, "No sessions yet.");
+                    ui.add_space(theme.spacing.xs);
+                    vidya::dim_label(ui, &theme, "New session or Resume to start.");
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for id in ids {
+                            let Some(session) = self.sessions.get(&id) else {
+                                continue;
+                            };
+                            let active = self.active == Some(id);
+                            let ws_label = session
+                                .workspace
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("workspace");
+                            let running_subs = session
+                                .subagents
+                                .iter()
+                                .filter(|s| s.status.is_live())
+                                .count();
+                            let sub_note = if session.subagents.is_empty() {
+                                None
+                            } else if running_subs > 0 {
+                                Some(format!(
+                                    "{running_subs}/{} subagents",
+                                    session.subagents.len()
+                                ))
+                            } else {
+                                Some(format!("{} subagents", session.subagents.len()))
+                            };
+
+                            let fill = if active {
+                                theme.palette.accent
+                            } else {
+                                theme.palette.button_bg
+                            };
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                if active {
+                                    theme.palette.accent
+                                } else {
+                                    theme.palette.border_soft
+                                },
+                            );
+                            let title_color = if active {
                                 theme.palette.accent_fg
                             } else {
-                                theme.palette.button_fg
+                                theme.palette.text
+                            };
+                            let dim_color = if active {
+                                theme.palette.accent_fg
+                            } else {
+                                theme.palette.text_secondary
+                            };
+
+                            let row = egui::Frame::NONE
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(theme.spacing.radius_md)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        vidya::status_dot(ui, &theme, session.alive);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&session.title)
+                                                    .size(theme.type_scale.body)
+                                                    .color(title_color),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(ws_label)
+                                            .size(theme.type_scale.caption)
+                                            .color(dim_color),
+                                    );
+                                    if let Some(note) = &sub_note {
+                                        ui.label(
+                                            egui::RichText::new(note)
+                                                .size(theme.type_scale.caption)
+                                                .color(dim_color),
+                                        );
+                                    }
+                                });
+
+                            let response = row.response.interact(egui::Sense::click());
+                            if response.clicked() {
+                                select = Some(id);
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Auto-rename from content").clicked() {
+                                    auto_rename = Some(id);
+                                    ui.close_menu();
+                                }
+                                if ui.button("Rename…").clicked() {
+                                    open_rename = Some(id);
+                                    ui.close_menu();
+                                }
                             });
-                        let fill = if active {
-                            theme.palette.accent
-                        } else {
-                            theme.palette.button_bg
-                        };
-                        let btn = egui::Button::new(text)
-                            .fill(fill)
-                            .stroke(egui::Stroke::new(1.0, theme.palette.border_soft))
-                            .corner_radius(theme.spacing.radius_md)
-                            .min_size(egui::vec2(0.0, theme.spacing.control_height));
-                        let response = ui.add(btn);
-                        if response.clicked() {
-                            select = Some(id);
-                        }
-                        if response.secondary_clicked() {
-                            select = Some(id);
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("Auto-rename from content").clicked() {
-                                auto_rename = Some(id);
-                                ui.close_menu();
+
+                            // Nested subagent rows (informational; select parent).
+                            if !session.subagents.is_empty() {
+                                ui.add_space(2.0);
+                                for sub in &session.subagents {
+                                    let child = egui::Frame::NONE
+                                        .inner_margin(egui::Margin {
+                                            left: 18,
+                                            right: 4,
+                                            top: 2,
+                                            bottom: 2,
+                                        })
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                vidya::status_dot(
+                                                    ui,
+                                                    &theme,
+                                                    sub.status.is_live(),
+                                                );
+                                                let label = subagent_label(sub);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(label)
+                                                            .size(theme.type_scale.caption)
+                                                            .color(
+                                                                theme.palette.text_secondary,
+                                                            ),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                        });
+                                    if child
+                                        .response
+                                        .interact(egui::Sense::click())
+                                        .clicked()
+                                    {
+                                        select = Some(id);
+                                    }
+                                }
                             }
-                            if ui.button("Rename…").clicked() {
-                                open_rename = Some(id);
-                                ui.close_menu();
-                            }
-                        });
-                    }
-                });
+
+                            ui.add_space(theme.spacing.sm);
+                        }
+                    });
             });
 
         if let Some(id) = select {
@@ -742,14 +869,29 @@ impl eframe::App for App {
         }
 
         self.poll_pty_events();
+        self.poll_subagents(ctx);
         // Before the terminal widget reads input, so we can steal Paste events.
         self.handle_agent_paste(ctx);
         self.show_header(ctx);
-        self.show_tabs(ctx);
+        self.show_sidebar(ctx);
         self.show_central(ctx);
         self.show_new_dialog(ctx);
         self.show_resume_dialog(ctx);
         self.show_rename_dialog(ctx);
+    }
+}
+
+fn subagent_label(sub: &crate::subagents::Subagent) -> String {
+    let status = match sub.status {
+        SubagentStatus::Running => "…",
+        SubagentStatus::Done => "✓",
+        SubagentStatus::Failed => "!",
+    };
+    match &sub.kind {
+        Some(kind) if !kind.is_empty() => {
+            format!("{status} {kind} · {}", sub.title)
+        }
+        _ => format!("{status} {}", sub.title),
     }
 }
 

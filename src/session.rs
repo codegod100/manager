@@ -445,11 +445,12 @@ fn build_args(draft: &NewSessionDraft, workspace: &Path) -> Vec<String> {
     {
         args.push("--resume".into());
         args.push(chat_id.to_string());
-    } else {
-        let prompt = draft.prompt.trim();
-        if !prompt.is_empty() {
-            args.push(prompt.to_string());
-        }
+    }
+
+    // Initial prompt still applies when resuming a freshly created empty chat.
+    let prompt = draft.prompt.trim();
+    if !prompt.is_empty() {
+        args.push(prompt.to_string());
     }
 
     args

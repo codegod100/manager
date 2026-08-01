@@ -2,6 +2,8 @@
 
 Desktop GUI for running multiple interactive [`cursor-agent`](https://cursor.com) sessions. Themed with [vidya](../vidya) (egui), terminals via [`egui_term`](https://crates.io/crates/egui_term) (alacritty PTY).
 
+![Agent Manager](assets/screenshot.png)
+
 ## Run
 
 From this checkout (with sibling `../vidya`):
@@ -33,14 +35,16 @@ nix build .#manager
 #       result/share/icons/hicolor/.../apps/manager.{svg,png}
 ```
 
-**New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`. Each session is a full agent TTY in a tab; **Close** removes the active tab.
+**New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. It runs `cursor-agent create-chat`, then spawns the PTY with `--resume <chatId>` so the session is bound to Cursor’s chat store. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`.
+
+The left **Agents** sidebar lists sessions (status, title, workspace) and nests Task/subagents discovered under each chat (`…/<chatId>/subagents/` plus Task records in the chat store). Click a row to focus that terminal; subagent rows select the parent. Right-click a session for rename. **Close** removes the active session.
 
 **Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`.
 
 ## Requirements
 
 - Rust toolchain
-- `cursor-agent` or `agent` on `PATH` (or set `CURSOR_AGENT` to the binary path)
+- `cursor-agent` on `PATH` (or set `CURSOR_AGENT` to the binary path)
 - Linux (Wayland or X11)
 - `wl-paste` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste
 

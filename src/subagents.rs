@@ -22,14 +22,6 @@ pub enum SubagentStatus {
 }
 
 impl SubagentStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Running => "running",
-            Self::Done => "done",
-            Self::Failed => "failed",
-        }
-    }
-
     pub fn is_live(self) -> bool {
         matches!(self, Self::Running)
     }
