@@ -1,10 +1,94 @@
 //! Main window: vidya chrome, session tabs, embedded agent terminals.
 
-use crate::session::{AgentSession, NewSessionDraft};
-use egui_term::{ColorPalette, PtyEvent, TerminalTheme, TerminalView};
+use crate::session::{list_saved_chats, AgentSession, NewSessionDraft, SavedChat};
+use egui_term::{BackendCommand, ColorPalette, PtyEvent, TerminalTheme, TerminalView};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use vidya::Theme;
+
+struct ResumeDialog {
+    filter: String,
+    chats: Vec<SavedChat>,
+    selected: Option<String>,
+    model: String,
+    trust: bool,
+    force: bool,
+    load_error: Option<String>,
+}
+
+struct RenameDialog {
+    id: u64,
+    draft: String,
+    /// Request focus once when the dialog opens.
+    focus: bool,
+}
+
+impl ResumeDialog {
+    fn load() -> Self {
+        match list_saved_chats() {
+            Ok(chats) => Self {
+                filter: String::new(),
+                chats,
+                selected: None,
+                model: String::new(),
+                trust: true,
+                force: false,
+                load_error: None,
+            },
+            Err(err) => Self {
+                filter: String::new(),
+                chats: Vec::new(),
+                selected: None,
+                model: String::new(),
+                trust: true,
+                force: false,
+                load_error: Some(err),
+            },
+        }
+    }
+
+    fn filtered(&self) -> Vec<&SavedChat> {
+        let q = self.filter.trim().to_lowercase();
+        self.chats
+            .iter()
+            .filter(|c| {
+                if q.is_empty() {
+                    return true;
+                }
+                c.title.to_lowercase().contains(&q)
+                    || c.workspace_label().to_lowercase().contains(&q)
+                    || c.id.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    fn selected_chat(&self) -> Option<&SavedChat> {
+        let id = self.selected.as_deref()?;
+        self.chats.iter().find(|c| c.id == id)
+    }
+
+    fn to_draft(&self) -> Result<NewSessionDraft, String> {
+        let chat = self
+            .selected_chat()
+            .ok_or_else(|| "select a chat to resume".to_string())?;
+        let workspace = chat
+            .cwd
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| {
+                "selected chat has no workspace path; cannot resume".to_string()
+            })?;
+        Ok(NewSessionDraft {
+            workspace,
+            model: self.model.clone(),
+            prompt: String::new(),
+            trust: self.trust,
+            force: self.force,
+            resume_chat_id: Some(chat.id.clone()),
+            tab_title: Some(chat.title.clone()),
+        })
+    }
+}
 
 pub struct App {
     theme: Theme,
@@ -14,6 +98,8 @@ pub struct App {
     pty_tx: Sender<(u64, PtyEvent)>,
     pty_rx: Receiver<(u64, PtyEvent)>,
     new_dialog: Option<NewSessionDraft>,
+    resume_dialog: Option<ResumeDialog>,
+    rename_dialog: Option<RenameDialog>,
     spawn_error: Option<String>,
     term_theme: TerminalTheme,
 }
@@ -29,9 +115,17 @@ impl App {
             pty_tx,
             pty_rx,
             new_dialog: None,
+            resume_dialog: None,
+            rename_dialog: None,
             spawn_error: None,
             term_theme: vidya_term_theme(),
         }
+    }
+
+    fn dialog_open(&self) -> bool {
+        self.new_dialog.is_some()
+            || self.resume_dialog.is_some()
+            || self.rename_dialog.is_some()
     }
 
     fn poll_pty_events(&mut self) {
@@ -47,7 +141,7 @@ impl App {
                 }
                 PtyEvent::Title(title) => {
                     if let Some(session) = self.sessions.get_mut(&id) {
-                        if session.alive {
+                        if session.alive && !session.title_locked {
                             session.title = title;
                         }
                     }
@@ -57,7 +151,7 @@ impl App {
         }
     }
 
-    fn spawn_from_draft(&mut self, ctx: &egui::Context, draft: NewSessionDraft) {
+    fn spawn_from_draft(&mut self, ctx: &egui::Context, draft: NewSessionDraft) -> bool {
         let id = self.next_id;
         self.next_id += 1;
         match AgentSession::spawn(id, ctx.clone(), self.pty_tx.clone(), &draft) {
@@ -65,12 +159,13 @@ impl App {
                 self.sessions.insert(id, session);
                 self.active = Some(id);
                 self.new_dialog = None;
+                self.resume_dialog = None;
                 self.spawn_error = None;
+                true
             }
             Err(err) => {
                 self.spawn_error = Some(err);
-                // Keep dialog open so the user can fix the path / flags.
-                self.new_dialog = Some(draft);
+                false
             }
         }
     }
@@ -97,6 +192,7 @@ impl App {
             .and_then(|id| self.sessions.get(&id))
             .map(|s| format!("#{} · {}", s.id, s.workspace.display()));
         let mut open_new = false;
+        let mut open_resume = false;
         let mut close = false;
 
         vidya::top_header(ctx, &theme, |ui| {
@@ -113,6 +209,10 @@ impl App {
                         close = true;
                     }
                     ui.add_space(theme.spacing.sm);
+                    if vidya::button(ui, &theme, "Resume").clicked() {
+                        open_resume = true;
+                    }
+                    ui.add_space(theme.spacing.sm);
                     if vidya::primary_button(ui, &theme, "New session").clicked() {
                         open_new = true;
                     }
@@ -122,6 +222,12 @@ impl App {
 
         if open_new {
             self.new_dialog = Some(NewSessionDraft::default());
+            self.resume_dialog = None;
+            self.spawn_error = None;
+        }
+        if open_resume {
+            self.resume_dialog = Some(ResumeDialog::load());
+            self.new_dialog = None;
             self.spawn_error = None;
         }
         if close {
@@ -137,6 +243,8 @@ impl App {
         let theme = self.theme.clone();
         let ids: Vec<u64> = self.sessions.keys().copied().collect();
         let mut select: Option<u64> = None;
+        let mut auto_rename: Option<u64> = None;
+        let mut open_rename: Option<u64> = None;
 
         egui::TopBottomPanel::top("session_tabs")
             .frame(
@@ -177,15 +285,112 @@ impl App {
                             .stroke(egui::Stroke::new(1.0, theme.palette.border_soft))
                             .corner_radius(theme.spacing.radius_md)
                             .min_size(egui::vec2(0.0, theme.spacing.control_height));
-                        if ui.add(btn).clicked() {
+                        let response = ui.add(btn);
+                        if response.clicked() {
                             select = Some(id);
                         }
+                        if response.secondary_clicked() {
+                            select = Some(id);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Auto-rename from content").clicked() {
+                                auto_rename = Some(id);
+                                ui.close_menu();
+                            }
+                            if ui.button("Rename…").clicked() {
+                                open_rename = Some(id);
+                                ui.close_menu();
+                            }
+                        });
                     }
                 });
             });
 
         if let Some(id) = select {
             self.active = Some(id);
+        }
+        if let Some(id) = auto_rename {
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.auto_rename_from_content();
+            }
+        }
+        if let Some(id) = open_rename {
+            if let Some(session) = self.sessions.get(&id) {
+                let mut draft = session.title.clone();
+                if let Some(base) = draft.strip_suffix(" (exited)") {
+                    draft = base.to_string();
+                }
+                self.rename_dialog = Some(RenameDialog {
+                    id,
+                    draft,
+                    focus: true,
+                });
+            }
+        }
+    }
+
+    fn show_rename_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.rename_dialog.take() else {
+            return;
+        };
+        if !self.sessions.contains_key(&dialog.id) {
+            return;
+        }
+
+        let theme = self.theme.clone();
+        let mut apply = false;
+        let mut cancel = false;
+        let mut keep_open = true;
+
+        egui::Window::new("Rename tab")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme.card_frame())
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                vidya::title_2(ui, &theme, "Tab title");
+                ui.add_space(theme.spacing.sm);
+                let response = vidya::text_field_singleline(ui, &theme, &mut dialog.draft);
+                if dialog.focus {
+                    response.request_focus();
+                    dialog.focus = false;
+                }
+                if response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !dialog.draft.trim().is_empty()
+                {
+                    apply = true;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    cancel = true;
+                }
+
+                ui.add_space(theme.spacing.md);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!dialog.draft.trim().is_empty(), |ui| {
+                        if vidya::primary_button(ui, &theme, "Rename").clicked() {
+                            apply = true;
+                        }
+                    });
+                    if vidya::button(ui, &theme, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            keep_open = false;
+        }
+        if apply {
+            let title = dialog.draft.trim().to_string();
+            if let Some(session) = self.sessions.get_mut(&dialog.id) {
+                session.set_user_title(title);
+            }
+            return;
+        }
+        if keep_open {
+            self.rename_dialog = Some(dialog);
         }
     }
 
@@ -242,7 +447,9 @@ impl App {
             self.spawn_error = None;
         }
         if spawn {
-            self.spawn_from_draft(ctx, draft);
+            if !self.spawn_from_draft(ctx, draft.clone()) {
+                self.new_dialog = Some(draft);
+            }
             return;
         }
         if keep_open {
@@ -250,10 +457,191 @@ impl App {
         }
     }
 
+    fn show_resume_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.resume_dialog.take() else {
+            return;
+        };
+
+        let theme = self.theme.clone();
+        let mut resume = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        let mut keep_open = true;
+        let error = self.spawn_error.clone();
+        let filtered: Vec<SavedChat> = dialog.filtered().into_iter().cloned().collect();
+        let selected = dialog.selected.clone();
+
+        egui::Window::new("Resume session")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([560.0, 480.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .frame(theme.card_frame())
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.set_min_height(360.0);
+                vidya::title_2(ui, &theme, "Past cursor-agent chats");
+                ui.add_space(theme.spacing.sm);
+                ui.horizontal(|ui| {
+                    vidya::dim_label(ui, &theme, "Filter");
+                    ui.add_space(theme.spacing.sm);
+                    let _ = vidya::text_field_singleline(ui, &theme, &mut dialog.filter);
+                    if vidya::button(ui, &theme, "Refresh").clicked() {
+                        refresh = true;
+                    }
+                });
+                ui.add_space(theme.spacing.sm);
+
+                if let Some(err) = &dialog.load_error {
+                    ui.colored_label(theme.palette.destructive, err);
+                    ui.add_space(theme.spacing.sm);
+                }
+
+                let list_height = (ui.available_height() - 140.0).max(160.0);
+                egui::ScrollArea::vertical()
+                    .max_height(list_height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if filtered.is_empty() {
+                            vidya::dim_label(ui, &theme, "No saved chats match.");
+                            return;
+                        }
+                        for chat in &filtered {
+                            let is_sel = selected.as_deref() == Some(chat.id.as_str());
+                            let title = egui::RichText::new(&chat.title)
+                                .size(theme.type_scale.body)
+                                .color(if is_sel {
+                                    theme.palette.accent_fg
+                                } else {
+                                    theme.palette.text
+                                });
+                            let meta = format!(
+                                "{} · {} · {}",
+                                chat.workspace_label(),
+                                chat.age_label(),
+                                &chat.id[..chat.id.len().min(8)]
+                            );
+                            let fill = if is_sel {
+                                theme.palette.accent
+                            } else {
+                                theme.palette.popover_bg
+                            };
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                if is_sel {
+                                    theme.palette.accent
+                                } else {
+                                    theme.palette.border_soft
+                                },
+                            );
+                            let row = egui::Frame::NONE
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(theme.spacing.radius_sm)
+                                .inner_margin(egui::Margin::symmetric(
+                                    theme.spacing.md as i8,
+                                    theme.spacing.sm as i8,
+                                ))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.vertical(|ui| {
+                                        ui.label(title);
+                                        ui.label(
+                                            egui::RichText::new(meta)
+                                                .size(theme.type_scale.caption)
+                                                .color(if is_sel {
+                                                    theme.palette.accent_fg
+                                                } else {
+                                                    theme.palette.text_secondary
+                                                }),
+                                        );
+                                    });
+                                });
+                            if row.response.interact(egui::Sense::click()).clicked() {
+                                dialog.selected = Some(chat.id.clone());
+                            }
+                            ui.add_space(theme.spacing.xs);
+                        }
+                    });
+
+                ui.add_space(theme.spacing.sm);
+                vidya::dim_label(ui, &theme, "Model (optional)");
+                vidya::text_field_singleline(ui, &theme, &mut dialog.model);
+                ui.add_space(theme.spacing.sm);
+                vidya::checkbox(ui, &theme, &mut dialog.trust, "Trust workspace (--trust)");
+                vidya::checkbox(ui, &theme, &mut dialog.force, "Force / yolo (--force)");
+
+                if let Some(err) = &error {
+                    ui.add_space(theme.spacing.sm);
+                    ui.colored_label(theme.palette.destructive, err);
+                }
+
+                ui.add_space(theme.spacing.md);
+                ui.horizontal(|ui| {
+                    let can_resume = dialog.selected.is_some();
+                    ui.add_enabled_ui(can_resume, |ui| {
+                        if vidya::primary_button(ui, &theme, "Resume").clicked() {
+                            resume = true;
+                        }
+                    });
+                    if vidya::button(ui, &theme, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            keep_open = false;
+            self.spawn_error = None;
+        }
+        if refresh {
+            let filter = dialog.filter;
+            let model = dialog.model;
+            let trust = dialog.trust;
+            let force = dialog.force;
+            let selected = dialog.selected;
+            let mut next = ResumeDialog::load();
+            next.filter = filter;
+            next.model = model;
+            next.trust = trust;
+            next.force = force;
+            if selected
+                .as_ref()
+                .is_some_and(|id| next.chats.iter().any(|c| &c.id == id))
+            {
+                next.selected = selected;
+            }
+            self.resume_dialog = Some(next);
+            self.spawn_error = None;
+            return;
+        }
+        if resume {
+            match dialog.to_draft() {
+                Ok(draft) => {
+                    if !self.spawn_from_draft(ctx, draft) {
+                        self.resume_dialog = Some(dialog);
+                    }
+                    return;
+                }
+                Err(err) => {
+                    self.spawn_error = Some(err);
+                    self.resume_dialog = Some(dialog);
+                    return;
+                }
+            }
+        }
+        if keep_open {
+            self.resume_dialog = Some(dialog);
+        }
+    }
+
     fn show_central(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
         let term_theme = self.term_theme.clone();
         let active = self.active;
+        // egui_term's set_focus(true) calls request_focus() every frame, which would
+        // steal keys from dialogs (new session / resume filter fields).
+        let term_focus = !self.dialog_open();
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme.palette.view_bg))
@@ -261,7 +649,7 @@ impl App {
                 if let Some(id) = active {
                     if let Some(session) = self.sessions.get_mut(&id) {
                         let terminal = TerminalView::new(ui, &mut session.backend)
-                            .set_focus(session.alive)
+                            .set_focus(session.alive && term_focus)
                             .set_theme(term_theme.clone())
                             .set_size(ui.available_size());
                         ui.add(terminal);
@@ -278,8 +666,69 @@ impl App {
                         &theme,
                         "New session opens an interactive cursor-agent PTY.",
                     );
+                    ui.add_space(theme.spacing.xs);
+                    vidya::dim_label(
+                        ui,
+                        &theme,
+                        "Resume reopens a past chat from ~/.cursor/chats.",
+                    );
                 });
             });
+    }
+
+    /// Forward Ctrl/Cmd+V to the agent as `^V` so it can attach clipboard images.
+    ///
+    /// egui-winit treats Ctrl+V as a paste shortcut and only emits `Event::Paste` when the
+    /// clipboard has text. Image-only clipboards therefore produce neither Paste nor a Key
+    /// press — only the Key *release* survives. We send `^V` on that release (cursor-agent
+    /// then reads the image via wl-paste/xclip). Text pastes are also deferred to release:
+    /// we drop the egui Paste event so egui_term does not double-send `^V`.
+    fn handle_agent_paste(&mut self, ctx: &egui::Context) {
+        // Dialog fields need normal egui text paste.
+        if self.dialog_open() {
+            return;
+        }
+
+        let (steal_paste, send_caret_v) = ctx.input(|i| {
+            let steal_paste = i.modifiers.command && !i.modifiers.shift;
+            let send_caret_v = i.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::V,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    } if modifiers.command && !modifiers.shift && !modifiers.alt
+                )
+            });
+            (steal_paste, send_caret_v)
+        });
+
+        if steal_paste {
+            ctx.input_mut(|i| {
+                i.events
+                    .retain(|e| !matches!(e, egui::Event::Paste(_)));
+            });
+        }
+
+        if !send_caret_v {
+            return;
+        }
+
+        let Some(id) = self.active else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if !session.alive {
+            return;
+        }
+
+        session
+            .backend
+            .process_command(BackendCommand::Write(vec![0x16]));
     }
 }
 
@@ -293,10 +742,14 @@ impl eframe::App for App {
         }
 
         self.poll_pty_events();
+        // Before the terminal widget reads input, so we can steal Paste events.
+        self.handle_agent_paste(ctx);
         self.show_header(ctx);
         self.show_tabs(ctx);
         self.show_central(ctx);
         self.show_new_dialog(ctx);
+        self.show_resume_dialog(ctx);
+        self.show_rename_dialog(ctx);
     }
 }
 

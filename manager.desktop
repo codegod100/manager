@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Agent Manager
+GenericName=Agent Sessions
+Comment=Multi-instance cursor-agent GUI
+Exec=@EXEC@
+Icon=@ICON@
+Categories=Development;TerminalEmulator;
+Keywords=agent;cursor;terminal;session;vidya;manager;
+Terminal=false
+StartupNotify=true
+StartupWMClass=manager

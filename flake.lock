@@ -18,7 +18,24 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "vidya": "vidya"
+      }
+    },
+    "vidya": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1785542525,
+        "narHash": "sha256-WcA5jn6nlqWpXe5sXoLa/BP5ByVWdDpPTpZaSay96P4=",
+        "ref": "refs/heads/main",
+        "rev": "12cc7dd2a8e860e9599448465be7b1362fdf7d88",
+        "revCount": 21,
+        "type": "git",
+        "url": "https://tangled.org/nandi.uk/vidya"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://tangled.org/nandi.uk/vidya"
       }
     }
   },
