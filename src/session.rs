@@ -1,12 +1,51 @@
 //! Resolve and spawn cursor-agent sessions into PTYs via egui_term.
 
-use crate::subagents::{self, Subagent};
-use egui_term::{BackendSettings, PtyEvent, TerminalBackend};
+use crate::subagents::{self, ChatSnapshot, SessionSummary, Subagent};
+use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Sender;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long after PTY Wakeup to keep the session-tab spinner up.
+const ACTIVITY_HOLD: Duration = Duration::from_millis(2500);
+
+/// Agent binary path resolved once (avoids `which` on the UI thread).
+static AGENT_BIN: OnceLock<Result<String, String>> = OnceLock::new();
+
+/// Everything needed to open a PTY after off-thread `create-chat` / validation.
+#[derive(Debug, Clone)]
+pub struct PreparedSession {
+    pub shell: String,
+    pub args: Vec<String>,
+    pub workspace: PathBuf,
+    pub chat_id: String,
+    pub title: String,
+    /// Images + prompt to inject into the interactive composer after the TUI is up.
+    ///
+    /// `--image` only works for headless prompts, so interactive sessions paste via
+    /// clipboard + `^V` instead (see [`AgentSession::progress_composer_seed`]).
+    pub composer_seed: Option<ComposerSeed>,
+}
+
+/// Initial composer contents deferred until the agent TUI can accept paste/input.
+#[derive(Debug, Clone)]
+pub struct ComposerSeed {
+    pub images: Vec<PathBuf>,
+    pub prompt: String,
+}
+
+/// In-progress injection of a [`ComposerSeed`] into a live PTY.
+#[derive(Debug)]
+pub struct ComposerSeedInject {
+    images: Vec<PathBuf>,
+    prompt: String,
+    /// `0..images.len()` paste that image; then type prompt; then submit if prompt set.
+    step: usize,
+    next_at: Instant,
+}
 
 /// Draft fields for the new-session / resume dialogs.
 #[derive(Debug, Clone)]
@@ -14,6 +53,8 @@ pub struct NewSessionDraft {
     pub workspace: String,
     pub model: String,
     pub prompt: String,
+    /// Clipboard images pasted into the initial prompt (injected into the TUI via `^V`).
+    pub images: Vec<PathBuf>,
     pub trust: bool,
     pub force: bool,
     /// When set, spawn with `--resume <id>` (initial prompt is ignored).
@@ -31,6 +72,7 @@ impl Default for NewSessionDraft {
             workspace: cwd,
             model: String::new(),
             prompt: String::new(),
+            images: Vec::new(),
             trust: true,
             force: false,
             resume_chat_id: None,
@@ -72,17 +114,26 @@ pub struct AgentSession {
     pub chat_id: String,
     /// Nested Task/subagents discovered under this chat.
     pub subagents: Vec<Subagent>,
+    /// Live status for spinner / needs-input (e.g. "Thinking…").
+    pub activity: Option<String>,
+    /// Structured retrospective of work done (summary panel).
+    pub summary: Option<SessionSummary>,
+    /// Latest chat meta title from the poller (kept even when [`Self::title_locked`]).
+    pub meta_title: Option<String>,
+    /// When true, hide nested Task rows in the sidebar.
+    pub tasks_folded: bool,
     /// When true, ignore OSC / PTY title updates so a user rename sticks.
     pub title_locked: bool,
+    /// Last PTY `Wakeup` (holds the tab spinner briefly between transcript polls).
+    last_activity: Option<Instant>,
+    /// Paste images + type prompt into the interactive composer once the TUI is ready.
+    composer_seed: Option<ComposerSeedInject>,
 }
 
 impl AgentSession {
-    pub fn spawn(
-        id: u64,
-        ctx: egui::Context,
-        pty_tx: Sender<(u64, PtyEvent)>,
-        draft: &NewSessionDraft,
-    ) -> Result<Self, String> {
+    /// Validate draft + `create-chat` if needed. Safe to run off the UI thread
+    /// (`create-chat` can take multiple seconds).
+    pub fn prepare(draft: &NewSessionDraft) -> Result<PreparedSession, String> {
         let workspace = PathBuf::from(draft.workspace.trim());
         if draft.workspace.trim().is_empty() {
             return Err("workspace path is required".into());
@@ -106,6 +157,19 @@ impl AgentSession {
         };
         let mut draft = draft.clone();
         draft.resume_chat_id = Some(chat_id.clone());
+
+        // Interactive TUI ignores `--image` (headless-only). When images were pasted in
+        // the new-session dialog, withhold the CLI prompt too and inject both via PTY.
+        let composer_seed = if draft.images.is_empty() {
+            None
+        } else {
+            let seed = ComposerSeed {
+                images: std::mem::take(&mut draft.images),
+                prompt: std::mem::take(&mut draft.prompt),
+            };
+            Some(seed)
+        };
+
         let args = build_args(&draft, &workspace);
         let title = draft
             .tab_title
@@ -113,6 +177,7 @@ impl AgentSession {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
+            .or_else(|| sanitize_auto_title(draft.prompt.trim()))
             .unwrap_or_else(|| {
                 workspace
                     .file_name()
@@ -121,34 +186,164 @@ impl AgentSession {
                     .to_string()
             });
 
+        Ok(PreparedSession {
+            shell,
+            args,
+            workspace,
+            chat_id,
+            title,
+            composer_seed,
+        })
+    }
+
+    /// Open the PTY on the UI thread after [`Self::prepare`].
+    pub fn spawn_prepared(
+        id: u64,
+        ctx: egui::Context,
+        pty_tx: Sender<(u64, PtyEvent)>,
+        prepared: PreparedSession,
+    ) -> Result<Self, String> {
         let backend = TerminalBackend::new(
             id,
             ctx,
             pty_tx,
             BackendSettings {
-                shell,
-                args,
-                working_directory: Some(workspace.clone()),
+                shell: prepared.shell,
+                args: prepared.args,
+                working_directory: Some(prepared.workspace.clone()),
             },
         )
         .map_err(|e| format!("failed to spawn agent PTY: {e}"))?;
 
         Ok(Self {
             id,
-            title,
-            workspace,
+            title: prepared.title,
+            workspace: prepared.workspace,
             backend,
             alive: true,
-            chat_id,
+            chat_id: prepared.chat_id,
             subagents: Vec::new(),
+            activity: Some("Starting…".into()),
+            summary: None,
+            meta_title: None,
+            tasks_folded: false,
             title_locked: false,
+            last_activity: Some(Instant::now()),
+            composer_seed: prepared.composer_seed.map(|seed| ComposerSeedInject {
+                images: seed.images,
+                prompt: seed.prompt,
+                step: 0,
+                // Give the interactive TUI a moment to paint the composer.
+                next_at: Instant::now() + Duration::from_millis(900),
+            }),
         })
     }
 
-    /// Refresh title (if unlocked) and subagent list from Cursor's chat store.
-    pub fn poll_chat_state(&mut self) -> bool {
-        let snap = subagents::poll_chat(&self.chat_id);
+    /// True while a deferred new-session image/prompt inject is still running.
+    pub fn has_pending_composer_seed(&self) -> bool {
+        self.composer_seed.is_some()
+    }
+
+    /// Advance clipboard/`^V`/prompt injection for images pasted on the new-session screen.
+    ///
+    /// Returns how long to wait before the next step (for `request_repaint_after`).
+    pub fn progress_composer_seed(&mut self) -> Option<Duration> {
+        let Some(inject) = self.composer_seed.as_mut() else {
+            return None;
+        };
+        if !self.alive {
+            self.clear_composer_seed();
+            return None;
+        }
+
+        let now = Instant::now();
+        if now < inject.next_at {
+            return Some(inject.next_at.saturating_duration_since(now));
+        }
+
+        let img_count = inject.images.len();
+        if inject.step < img_count {
+            let path = inject.images[inject.step].clone();
+            if crate::clipboard::set_clipboard_image(&path) {
+                self.backend
+                    .process_command(BackendCommand::Write(vec![0x16]));
+            }
+            inject.step += 1;
+            inject.next_at = Instant::now() + Duration::from_millis(180);
+            return Some(Duration::from_millis(180));
+        }
+
+        if inject.step == img_count {
+            let prompt = inject.prompt.trim();
+            if !prompt.is_empty() {
+                self.backend
+                    .process_command(BackendCommand::Write(prompt.as_bytes().to_vec()));
+                inject.step += 1;
+                inject.next_at = Instant::now() + Duration::from_millis(60);
+                return Some(Duration::from_millis(60));
+            }
+            // Image-only: leave the composer open for the user to add text / submit.
+            self.clear_composer_seed();
+            return None;
+        }
+
+        // Submit the seeded prompt.
+        self.backend
+            .process_command(BackendCommand::Write(vec![b'\r']));
+        self.clear_composer_seed();
+        None
+    }
+
+    fn clear_composer_seed(&mut self) {
+        if let Some(inject) = self.composer_seed.take() {
+            for path in inject.images {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Record PTY output so the sidebar spinner stays up between chat polls.
+    pub fn bump_activity(&mut self) {
+        self.last_activity = Some(Instant::now());
+    }
+
+    /// Alive and waiting on the user (prompt / follow-up).
+    pub fn needs_input(&self) -> bool {
+        self.alive
+            && self
+                .activity
+                .as_deref()
+                .is_some_and(activity_needs_input)
+    }
+
+    /// Mid-turn work: live Tasks, non-idle activity label, or recent PTY output.
+    pub fn has_activity(&self) -> bool {
+        if !self.alive || self.needs_input() {
+            return false;
+        }
+        if self.subagents.iter().any(|s| s.status.is_live()) {
+            return true;
+        }
+        match self.activity.as_deref() {
+            None | Some("Idle") | Some("Waiting for input") => self
+                .last_activity
+                .is_some_and(|t| t.elapsed() < ACTIVITY_HOLD),
+            Some(_) => true,
+        }
+    }
+
+    /// Apply a snapshot produced off-thread by [`subagents::poll_chat`].
+    pub fn apply_chat_snapshot(&mut self, snap: ChatSnapshot) -> bool {
         let mut changed = false;
+
+        // Always keep the polled meta title so auto-rename can use it even when
+        // the displayed tab title is locked.
+        if let Some(title) = snap.title.clone() {
+            if self.meta_title.as_ref() != Some(&title) {
+                self.meta_title = Some(title);
+                changed = true;
+            }
+        }
 
         if !self.title_locked {
             if let Some(title) = snap.title {
@@ -167,7 +362,25 @@ impl AgentSession {
         }
 
         if self.subagents != snap.subagents {
+            let had_live = self.subagents.iter().any(|s| s.status.is_live());
+            let has_live = snap.subagents.iter().any(|s| s.status.is_live());
             self.subagents = snap.subagents;
+            // Collapse the list once everything finishes so the sidebar stays tidy.
+            if had_live && !has_live && !self.subagents.is_empty() {
+                self.tasks_folded = true;
+            }
+            // Expand when new live work appears.
+            if has_live && !had_live {
+                self.tasks_folded = false;
+            }
+            changed = true;
+        }
+        if self.activity != snap.activity {
+            self.activity = snap.activity;
+            changed = true;
+        }
+        if self.summary != snap.summary {
+            self.summary = snap.summary;
             changed = true;
         }
         changed
@@ -186,7 +399,7 @@ impl AgentSession {
         self.title_locked = true;
     }
 
-    /// Derive a tab title from Cursor chat meta and/or visible terminal text.
+    /// Derive a tab title from already-polled chat state and/or visible terminal text.
     pub fn auto_rename_from_content(&mut self) {
         if let Some(title) = suggest_title_from_content(self) {
             self.set_user_title(title);
@@ -194,40 +407,31 @@ impl AgentSession {
     }
 }
 
-/// Prefer Cursor's chat title for this session; fall back to terminal text.
+/// Prefer poller state (meta title, then summary); fall back to terminal text.
+///
+/// Does not scan `~/.cursor/chats` on the UI thread — that data arrives via
+/// [`AgentSession::apply_chat_snapshot`].
 fn suggest_title_from_content(session: &mut AgentSession) -> Option<String> {
-    if let Some(title) = lookup_chat_title_for_session(session) {
+    if let Some(title) = session
+        .meta_title
+        .as_deref()
+        .and_then(meaningful_meta_title)
+    {
+        return Some(title.to_string());
+    }
+    if let Some(title) = session.summary.as_ref().and_then(|s| s.title_hint()).and_then(sanitize_auto_title) {
         return Some(title);
     }
     title_from_terminal(&mut session.backend)
 }
 
-fn lookup_chat_title_for_session(session: &AgentSession) -> Option<String> {
-    let chats = list_saved_chats().ok()?;
-    if let Some(chat) = chats.iter().find(|c| c.id == session.chat_id) {
-        let title = chat.title.trim();
-        if !title.is_empty() && title != "Untitled" {
-            return Some(title.to_string());
-        }
+fn meaningful_meta_title(title: &str) -> Option<&str> {
+    let title = title.trim();
+    if title.is_empty() || title == "Untitled" {
+        None
+    } else {
+        Some(title)
     }
-
-    let ws = normalize_path(&session.workspace);
-    chats.into_iter().find_map(|c| {
-        let cwd = c.cwd.as_deref()?;
-        if normalize_path(Path::new(cwd)) != ws {
-            return None;
-        }
-        let title = c.title.trim();
-        if title.is_empty() || title == "Untitled" {
-            None
-        } else {
-            Some(title.to_string())
-        }
-    })
-}
-
-fn normalize_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn title_from_terminal(backend: &mut TerminalBackend) -> Option<String> {
@@ -265,6 +469,11 @@ fn push_terminal_line(lines: &mut Vec<String>, buf: &str) {
     }
 }
 
+/// Only structured questions (AskQuestion), not every idle “Waiting for input”.
+fn activity_needs_input(activity: &str) -> bool {
+    activity.starts_with("Waiting for answer")
+}
+
 fn sanitize_auto_title(line: &str) -> Option<String> {
     let mut s = line.trim().to_string();
     // Strip common TUI bullets / prompt chrome.
@@ -291,13 +500,42 @@ fn sanitize_auto_title(line: &str) -> Option<String> {
     }
 }
 
-/// `CURSOR_AGENT` env, else `cursor-agent` on PATH.
+/// Title-Case Each Word for manual renames.
+pub fn title_case_words(s: &str) -> String {
+    s.split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut out: String = first.to_uppercase().collect();
+                    out.extend(chars.flat_map(|c| c.to_lowercase()));
+                    out
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `CURSOR_AGENT` env (path override), else `cursor-agent` on PATH.
 ///
-/// Does not fall through to bare `agent` — that name is often another CLI (e.g. grok).
+/// Cursor itself sets `CURSOR_AGENT=1` inside agent sessions as a boolean flag —
+/// that must not be treated as a binary path. Does not fall through to bare
+/// `agent` — that name is often another CLI (e.g. grok).
+///
+/// Result is cached — safe to call from background threads; does not block the
+/// UI after the first resolution.
 pub fn resolve_agent_binary() -> Result<String, String> {
+    AGENT_BIN
+        .get_or_init(resolve_agent_binary_uncached)
+        .clone()
+}
+
+fn resolve_agent_binary_uncached() -> Result<String, String> {
     if let Ok(path) = std::env::var("CURSOR_AGENT") {
         let path = path.trim();
-        if !path.is_empty() {
+        if looks_like_agent_binary(path) {
             return Ok(path.to_string());
         }
     }
@@ -307,8 +545,17 @@ pub fn resolve_agent_binary() -> Result<String, String> {
     }
 
     Err(
-        "cursor-agent not found (set CURSOR_AGENT or install cursor-agent on PATH)".into(),
+        "cursor-agent not found (set CURSOR_AGENT to a binary path or install cursor-agent on PATH)"
+            .into(),
     )
+}
+
+/// True when `CURSOR_AGENT` looks like an executable override, not Cursor's `=1` flag.
+fn looks_like_agent_binary(path: &str) -> bool {
+    if path.is_empty() || path == "0" || path == "1" {
+        return false;
+    }
+    Path::new(path).is_file() || which(path).is_some()
 }
 
 /// Scan `~/.cursor/chats` for resumable sessions (newest first).
@@ -360,6 +607,10 @@ fn parse_saved_chat(chat_path: &Path, meta_path: &Path) -> Option<SavedChat> {
 
     // Empty shells (created but never prompted) are not useful to resume.
     if value.get("hasConversation").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    // Nested Task chats are opened from the parent session's task rows.
+    if value.get("isSubagent").and_then(|v| v.as_bool()) == Some(true) {
         return None;
     }
 
@@ -448,6 +699,7 @@ fn build_args(draft: &NewSessionDraft, workspace: &Path) -> Vec<String> {
     }
 
     // Initial prompt still applies when resuming a freshly created empty chat.
+    // Images are not passed here: `--image` is headless-only; see ComposerSeed.
     let prompt = draft.prompt.trim();
     if !prompt.is_empty() {
         args.push(prompt.to_string());
