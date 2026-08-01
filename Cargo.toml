@@ -1,0 +1,22 @@
+[package]
+name = "manager"
+version = "0.1.0"
+edition = "2021"
+description = "Multi-instance cursor-agent manager (vidya + egui_term)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "manager"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.31"
+egui_term = "0.1.0"
+vidya = { path = "../vidya" }
