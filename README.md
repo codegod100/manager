@@ -37,14 +37,14 @@ nix build .#manager
 
 **New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. It runs `cursor-agent create-chat`, then spawns the PTY with `--resume <chatId>` so the session is bound to Cursor’s chat store. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`.
 
-The left **Agents** sidebar lists sessions (status, title, workspace) and nests Task/subagents discovered under each chat (`…/<chatId>/subagents/` plus Task records in the chat store). Click a row to focus that terminal; subagent rows select the parent. Right-click a session for rename. **Close** removes the active session.
+The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests Tasks under each session (from `agent-transcripts/<chatId>/`, `subagents/`, and Task records in the chat store). Click a row to focus that terminal; task rows select the parent session. Right-click a session for rename. **Close** removes the active session.
 
 **Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`.
 
 ## Requirements
 
 - Rust toolchain
-- `cursor-agent` on `PATH` (or set `CURSOR_AGENT` to the binary path)
+- `cursor-agent` on `PATH` (or set `CURSOR_AGENT` to an executable path; Cursor’s in-session `CURSOR_AGENT=1` flag is ignored)
 - Linux (Wayland or X11)
 - `wl-paste` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste
 
