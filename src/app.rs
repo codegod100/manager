@@ -1,20 +1,21 @@
 //! Main window: vidya chrome, session sidebar, embedded agent terminals.
 
 use crate::session::{
-    list_saved_chats, title_case_words, AgentSession, NewSessionDraft, PreparedSession,
+    kill_pid, list_saved_chats, title_case_words, AgentSession, NewSessionDraft, PreparedSession,
     SavedChat,
 };
-use crate::subagents::{self, ChatSnapshot, SessionSummary, SubagentStatus, SummaryKind};
-use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
-use egui::{ColorImage, FontData, FontFamily, FontId, TextureHandle};
+use crate::subagents::{self, ChatSnapshot, SubagentStatus};
+use alacritty_terminal::selection::SelectionType;
+use egui::text::{LayoutJob, TextFormat};
+use egui::{ColorImage, FontData, FontDefinitions, FontFamily, FontId, TextureHandle};
 use egui_term::{
-    BackendCommand, ColorPalette, FontSettings, PtyEvent, TerminalFont, TerminalTheme,
-    TerminalView,
+    BackendCommand, Binding, BindingAction, ColorPalette, FontSettings, InputKind, PtyEvent,
+    TerminalBackend, TerminalFont, TerminalMode, TerminalTheme, TerminalView,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vidya::Theme;
 
 /// JetBrains Mono — includes `→` at the same advance as ASCII, unlike egui’s
@@ -24,8 +25,25 @@ const TERM_FONT_TTF: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf
 const TERM_FONT_NAME: &str = "jetbrains-mono";
 const TERM_FONT_SIZE: f32 = 14.0;
 
+/// DejaVu braille + Noto `⌕` — glyphs JetBrains + egui defaults lack
+/// (cursor-agent spinner / Find icon). See `assets/NOTICE` /
+/// `scripts/rebuild-term-symbols-ttf.sh`.
+const TERM_SYMBOLS_TTF: &[u8] = include_bytes!("../assets/term-symbols.ttf");
+const TERM_SYMBOLS_NAME: &str = "term-symbols";
+
 /// How often the background chat poller re-reads store/transcripts.
 const CHAT_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
+/// How long to wait for `PtyEvent::Exit` after killing a child before giving up
+/// and `mem::forget`ing the backend (avoids egui_term's Shutdown busy-spin).
+const PTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Backend held after tab close until the PTY child exit delivers `Event::Exit`.
+struct DrainingPty {
+    id: u64,
+    backend: TerminalBackend,
+    since: Instant,
+}
 
 struct ResumeDialog {
     filter: String,
@@ -45,6 +63,38 @@ struct RenameDialog {
     /// Request focus once when the dialog opens.
     focus: bool,
 }
+
+/// Split bash → Nushell util dialog.
+struct ConvertDialog {
+    bash: String,
+    nushell: String,
+    error: Option<String>,
+    /// True while cursor-agent `--print` convert runs off-thread.
+    converting: bool,
+    /// Request focus on the bash field once when opened.
+    focus: bool,
+}
+
+impl Default for ConvertDialog {
+    fn default() -> Self {
+        Self {
+            bash: String::new(),
+            nushell: String::new(),
+            error: None,
+            converting: false,
+            focus: true,
+        }
+    }
+}
+
+/// One successful bash → Nushell conversion (newest first in [`App::convert_history`]).
+#[derive(Clone)]
+struct ConvertSnippet {
+    bash: String,
+    nushell: String,
+}
+
+const CONVERT_HISTORY_MAX: usize = 40;
 
 /// One-shot background prepare for New/Resume spawn.
 struct PendingSpawn {
@@ -144,6 +194,7 @@ pub struct App {
     new_dialog: Option<NewSessionDraft>,
     resume_dialog: Option<ResumeDialog>,
     rename_dialog: Option<RenameDialog>,
+    convert_dialog: Option<ConvertDialog>,
     spawn_error: Option<String>,
     pending_spawn: Option<PendingSpawn>,
     /// Bumped on each [`Self::begin_spawn`] / cancel so stale prepares are dropped.
@@ -151,10 +202,18 @@ pub struct App {
     spawn_rx: Receiver<(u64, Result<PreparedSession, String>)>,
     spawn_tx: Sender<(u64, Result<PreparedSession, String>)>,
     resume_load_rx: Option<Receiver<Result<Vec<SavedChat>, String>>>,
+    /// Bumped when starting / cancelling a bash→nu convert so stale results drop.
+    convert_gen: u64,
+    convert_rx: Receiver<(u64, Result<String, String>)>,
+    convert_tx: Sender<(u64, Result<String, String>)>,
+    /// Session-local convert history (newest first); survives dialog close.
+    convert_history: Vec<ConvertSnippet>,
     term_theme: TerminalTheme,
     term_font: TerminalFont,
     /// Thumbnails for images pasted into the new-session prompt.
     prompt_image_textures: BTreeMap<PathBuf, TextureHandle>,
+    /// Closed-but-not-yet-dropped backends waiting for `PtyEvent::Exit`.
+    draining: Vec<DrainingPty>,
 }
 
 impl App {
@@ -164,6 +223,7 @@ impl App {
         let (chat_watch_tx, chat_watch_rx) = mpsc::channel::<Vec<ChatWatch>>();
         let (chat_snap_tx, chat_snap_rx) = mpsc::channel::<(u64, ChatSnapshot)>();
         let (spawn_tx, spawn_rx) = mpsc::channel();
+        let (convert_tx, convert_rx) = mpsc::channel();
         let poll_ctx = cc.egui_ctx.clone();
         std::thread::Builder::new()
             .name("chat-poller".into())
@@ -186,17 +246,23 @@ impl App {
             new_dialog: None,
             resume_dialog: None,
             rename_dialog: None,
+            convert_dialog: None,
             spawn_error: None,
             pending_spawn: None,
             spawn_gen: 0,
             spawn_rx,
             spawn_tx,
             resume_load_rx: None,
+            convert_gen: 0,
+            convert_rx,
+            convert_tx,
+            convert_history: Vec::new(),
             term_theme: vidya_term_theme(),
             term_font: TerminalFont::new(FontSettings {
                 font_type: term_font_id(),
             }),
             prompt_image_textures: BTreeMap::new(),
+            draining: Vec::new(),
         }
     }
 
@@ -204,12 +270,15 @@ impl App {
         self.new_dialog.is_some()
             || self.resume_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.convert_dialog.is_some()
     }
 
-    fn poll_pty_events(&mut self) {
+    fn poll_pty_events(&mut self, ctx: &egui::Context) {
         while let Ok((id, event)) = self.pty_rx.try_recv() {
             match event {
                 PtyEvent::Exit => {
+                    // Subscriber thread has exited; safe to Drop the backend now.
+                    self.finish_draining(id);
                     if let Some(session) = self.sessions.get_mut(&id) {
                         session.alive = false;
                         if !session.title.ends_with(" (exited)") {
@@ -233,6 +302,28 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        self.poll_draining_timeouts(ctx);
+    }
+
+    fn finish_draining(&mut self, id: u64) {
+        self.draining.retain(|d| d.id != id);
+    }
+
+    fn poll_draining_timeouts(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.draining.len() {
+            if self.draining[i].since.elapsed() >= PTY_DRAIN_TIMEOUT {
+                let drained = self.draining.swap_remove(i);
+                // Exit never arrived — leak the backend so Drop's Shutdown cannot
+                // busy-spin egui_term's subscriber thread.
+                std::mem::forget(drained.backend);
+            } else {
+                i += 1;
+            }
+        }
+        if !self.draining.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 
@@ -315,6 +406,81 @@ impl App {
         self.spawn_gen = self.spawn_gen.wrapping_add(1);
     }
 
+    fn begin_convert(&mut self, ctx: &egui::Context, bash: String) {
+        self.convert_gen = self.convert_gen.wrapping_add(1);
+        let gen = self.convert_gen;
+        if let Some(dialog) = self.convert_dialog.as_mut() {
+            dialog.converting = true;
+            dialog.error = None;
+        }
+        let tx = self.convert_tx.clone();
+        let convert_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((gen, crate::convert::bash_to_nushell(&bash)));
+            convert_ctx.request_repaint();
+        });
+    }
+
+    fn cancel_convert(&mut self) {
+        self.convert_gen = self.convert_gen.wrapping_add(1);
+        if let Some(dialog) = self.convert_dialog.as_mut() {
+            dialog.converting = false;
+        }
+    }
+
+    fn drain_convert(&mut self) {
+        loop {
+            let Ok((gen, result)) = self.convert_rx.try_recv() else {
+                return;
+            };
+            if gen != self.convert_gen {
+                continue;
+            }
+            if self.convert_dialog.is_none() {
+                continue;
+            }
+            let push = {
+                let dialog = self.convert_dialog.as_mut().unwrap();
+                dialog.converting = false;
+                match result {
+                    Ok(nushell) => {
+                        let bash = dialog.bash.clone();
+                        dialog.nushell = nushell.clone();
+                        dialog.error = None;
+                        Some((bash, nushell))
+                    }
+                    Err(err) => {
+                        dialog.error = Some(err);
+                        None
+                    }
+                }
+            };
+            if let Some((bash, nushell)) = push {
+                self.push_convert_history(bash, nushell);
+            }
+        }
+    }
+
+    fn push_convert_history(&mut self, bash: String, nushell: String) {
+        let bash = bash.trim().to_string();
+        let nushell = nushell.trim().to_string();
+        if bash.is_empty() || nushell.is_empty() {
+            return;
+        }
+        self.convert_history
+            .retain(|s| s.bash.trim() != bash || s.nushell.trim() != nushell);
+        self.convert_history.insert(
+            0,
+            ConvertSnippet {
+                bash,
+                nushell,
+            },
+        );
+        if self.convert_history.len() > CONVERT_HISTORY_MAX {
+            self.convert_history.truncate(CONVERT_HISTORY_MAX);
+        }
+    }
+
     fn drain_pending_spawn(&mut self, ctx: &egui::Context) {
         loop {
             let Ok((gen, result)) = self.spawn_rx.try_recv() else {
@@ -389,7 +555,21 @@ impl App {
     }
 
     fn close_session(&mut self, id: u64) {
-        self.sessions.remove(&id);
+        if let Some(session) = self.sessions.remove(&id) {
+            if session.alive {
+                // Kill child first so alacritty emits Exit and egui_term's
+                // subscriber breaks cleanly; only then Drop the backend.
+                if let Some(pid) = session.child_pid {
+                    kill_pid(pid);
+                }
+                self.draining.push(DrainingPty {
+                    id,
+                    backend: session.backend,
+                    since: Instant::now(),
+                });
+            }
+            // Already dead: subscriber already exited on Exit; Drop is safe.
+        }
         if self.active == Some(id) {
             self.active = self
                 .sessions
@@ -398,6 +578,25 @@ impl App {
                 .map(|(k, _)| *k)
                 .or_else(|| self.sessions.keys().next().copied());
         }
+    }
+
+    /// Tear down all PTYs without triggering egui_term Shutdown busy-spins.
+    fn shutdown_all_sessions(&mut self) {
+        let sessions = std::mem::take(&mut self.sessions);
+        for (_, session) in sessions {
+            if let Some(pid) = session.child_pid {
+                kill_pid(pid);
+            }
+            // Forget backends: process is exiting; don't Drop → Shutdown race.
+            std::mem::forget(session.backend);
+        }
+        for drained in self.draining.drain(..) {
+            std::mem::forget(drained.backend);
+        }
+        self.active = None;
+        let _ = self.chat_watch_tx.send(Vec::new());
+        self.last_chat_watch.clear();
+        self.cancel_pending_spawn();
     }
 
     /// Focus an already-open Task tab, or spawn `--resume` for its chat id.
@@ -442,6 +641,7 @@ impl App {
             .map(|s| format!("#{} · {}", s.id, s.workspace.display()));
         let mut open_new = false;
         let mut open_resume = false;
+        let mut open_convert = false;
         let busy = self.pending_spawn.is_some();
 
         vidya::top_header(ctx, &theme, |ui| {
@@ -465,6 +665,17 @@ impl App {
                             open_new = true;
                         }
                     });
+                    ui.add_space(theme.spacing.sm);
+                    let utils_text = egui::RichText::new("Utils")
+                        .size(theme.type_scale.body)
+                        .color(theme.palette.button_fg);
+                    ui.menu_button(utils_text, |ui| {
+                        ui.set_min_width(180.0);
+                        if ui.button("Convert to nushell").clicked() {
+                            open_convert = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
         });
@@ -481,13 +692,22 @@ impl App {
             self.new_dialog = Some(draft);
             self.resume_dialog = None;
             self.resume_load_rx = None;
+            self.convert_dialog = None;
             self.spawn_error = None;
         }
         if open_resume {
             self.resume_dialog = Some(ResumeDialog::loading());
             self.new_dialog = None;
+            self.convert_dialog = None;
             self.spawn_error = None;
             self.start_resume_load(ctx);
+        }
+        if open_convert {
+            self.convert_dialog = Some(ConvertDialog::default());
+            self.new_dialog = None;
+            self.resume_dialog = None;
+            self.resume_load_rx = None;
+            self.spawn_error = None;
         }
     }
 
@@ -521,9 +741,6 @@ impl App {
             )
             .show_separator_line(false)
             .show(ctx, |ui| {
-                vidya::title_2(ui, &theme, "Agents");
-                ui.add_space(theme.spacing.sm);
-
                 if groups.is_empty() {
                     vidya::dim_label(ui, &theme, "No sessions yet.");
                     ui.add_space(theme.spacing.xs);
@@ -619,9 +836,12 @@ impl App {
 
                                 ui.push_id(id, |ui| {
                                     let mut close_clicked = false;
-                                    // Full Frame hit target: nested with_layout shrink-wraps to
-                                    // title content, so short titles left dead zones on the row.
-                                    // × stays preferred via egui’s thinner-widget hit testing.
+                                    // Frame::end allocates *after* children, so a full-row
+                                    // Sense::click on the Frame sits on top of × and steals
+                                    // the hit (egui only prefers thinner targets when they
+                                    // aren't fully contained). Sense select on a rect that
+                                    // excludes × instead.
+                                    let mut close_rect = None;
                                     let row = egui::Frame::NONE
                                         .fill(fill)
                                         .stroke(stroke)
@@ -648,6 +868,7 @@ impl App {
                                                                 .min_size(egui::vec2(18.0, 18.0)),
                                                             )
                                                             .on_hover_text("Close");
+                                                        close_rect = Some(x.rect);
                                                         if x.clicked() {
                                                             close_clicked = true;
                                                         }
@@ -741,7 +962,15 @@ impl App {
                                             });
                                         });
 
-                                    let response = row.response.interact(egui::Sense::click());
+                                    let mut select_rect = row.response.rect;
+                                    if let Some(xr) = close_rect {
+                                        select_rect.max.x = select_rect.max.x.min(xr.min.x);
+                                    }
+                                    let response = ui.interact(
+                                        select_rect,
+                                        ui.id().with("session_select"),
+                                        egui::Sense::click(),
+                                    );
                                     if close_clicked {
                                         close = Some(id);
                                     } else if response.clicked() {
@@ -993,6 +1222,199 @@ impl App {
         }
         if keep_open {
             self.rename_dialog = Some(dialog);
+        }
+    }
+
+    fn show_convert_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.convert_dialog.take() else {
+            return;
+        };
+
+        let theme = self.theme.clone();
+        let mut convert = false;
+        let mut close = false;
+        let mut copy = false;
+        let mut clear_history = false;
+        let mut restore: Option<usize> = None;
+        let mut keep_open = true;
+        let converting = dialog.converting;
+        let can_convert = !dialog.bash.trim().is_empty() && !converting;
+        let can_copy = !dialog.nushell.trim().is_empty();
+        let history = self.convert_history.clone();
+
+        vidya::dialog("Convert to nushell", &theme)
+            .id(egui::Id::new("manager_convert_dialog"))
+            .default_size([720.0, 560.0])
+            .min_width(480.0)
+            .min_height(360.0)
+            .show(ctx, |ui| {
+                vidya::dim_label(
+                    ui,
+                    &theme,
+                    "Paste bash on the left; Convert runs cursor-agent (ask mode).",
+                );
+                ui.add_space(theme.spacing.sm);
+
+                let footer = theme.spacing.control_height
+                    + theme.spacing.md
+                    + if dialog.error.is_some() {
+                        theme.type_scale.body + theme.spacing.sm
+                    } else {
+                        0.0
+                    };
+                let history_h = 140.0;
+                let history_block = theme.type_scale.title_2
+                    + theme.spacing.xs
+                    + theme.spacing.sm
+                    + history_h;
+                let body_h = (ui.available_height() - footer - history_block)
+                    .max(theme.spacing.control_height * 4.0);
+                let rows = ((body_h / (theme.type_scale.body * 1.5)).floor() as usize).max(4);
+                let min_col = (ui.available_width() * 0.35).clamp(180.0, 280.0);
+
+                vidya::two_col(
+                    ui,
+                    &theme,
+                    min_col,
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            vidya::title_2(ui, &theme, "Bash");
+                        });
+                        ui.add_space(theme.spacing.xs);
+                        let resp = vidya::text_field_multiline(ui, &theme, &mut dialog.bash, rows);
+                        if dialog.focus {
+                            resp.request_focus();
+                            dialog.focus = false;
+                        }
+                    },
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            vidya::title_2(ui, &theme, "Nushell");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if vidya::icon_button(ui, &theme, vidya::Icon::Copy, "Copy Nushell")
+                                    .clicked()
+                                    && can_copy
+                                {
+                                    copy = true;
+                                }
+                            });
+                        });
+                        ui.add_space(theme.spacing.xs);
+                        ui.add_enabled_ui(!converting, |ui| {
+                            vidya::text_field_multiline(ui, &theme, &mut dialog.nushell, rows);
+                        });
+                    },
+                );
+
+                ui.add_space(theme.spacing.sm);
+                ui.horizontal(|ui| {
+                    vidya::title_2(ui, &theme, "History");
+                    if !history.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if vidya::button(ui, &theme, "Clear").clicked() {
+                                clear_history = true;
+                            }
+                        });
+                    }
+                });
+                ui.add_space(theme.spacing.xs);
+                egui::ScrollArea::vertical()
+                    .id_salt("convert_history")
+                    .max_height(history_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if history.is_empty() {
+                            vidya::dim_label(ui, &theme, "Converted snippets show up here.");
+                            return;
+                        }
+                        for (idx, snippet) in history.iter().enumerate() {
+                            let bash_preview = first_line_preview(&snippet.bash, 48);
+                            let nu_preview = first_line_preview(&snippet.nushell, 48);
+                            let selected = dialog.bash.trim() == snippet.bash.trim()
+                                && dialog.nushell.trim() == snippet.nushell.trim();
+                            let label = format!("{bash_preview}  →  {nu_preview}");
+                            let text = egui::RichText::new(label)
+                                .size(theme.type_scale.caption)
+                                .color(if selected {
+                                    theme.palette.accent
+                                } else {
+                                    theme.palette.text
+                                });
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(text)
+                                        .sense(egui::Sense::click())
+                                        .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "Bash:\n{}\n\nNushell:\n{}",
+                                    snippet.bash, snippet.nushell
+                                ));
+                            if resp.clicked() && !converting {
+                                restore = Some(idx);
+                            }
+                        }
+                    });
+
+                if let Some(err) = &dialog.error {
+                    ui.add_space(theme.spacing.sm);
+                    ui.colored_label(theme.palette.destructive, err);
+                }
+
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) && !converting {
+                    close = true;
+                }
+
+                ui.add_space(theme.spacing.md);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(can_convert, |ui| {
+                        let label = if converting {
+                            "Converting…"
+                        } else {
+                            "Convert"
+                        };
+                        if vidya::primary_button(ui, &theme, label).clicked() {
+                            convert = true;
+                        }
+                    });
+                    ui.add_enabled_ui(can_copy, |ui| {
+                        if vidya::button(ui, &theme, "Copy").clicked() {
+                            copy = true;
+                        }
+                    });
+                    if vidya::button(ui, &theme, if converting { "Cancel" } else { "Close" })
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+
+        if clear_history {
+            self.convert_history.clear();
+        }
+        if let Some(idx) = restore {
+            if let Some(snippet) = self.convert_history.get(idx).cloned() {
+                dialog.bash = snippet.bash;
+                dialog.nushell = snippet.nushell;
+                dialog.error = None;
+            }
+        }
+        if copy {
+            ctx.copy_text(dialog.nushell.clone());
+        }
+        if convert {
+            let bash = dialog.bash.clone();
+            self.convert_dialog = Some(dialog);
+            self.begin_convert(ctx, bash);
+            return;
+        }
+        if close {
+            self.cancel_convert();
+            keep_open = false;
+        }
+        if keep_open {
+            self.convert_dialog = Some(dialog);
         }
     }
 
@@ -1329,13 +1751,43 @@ impl App {
                             avail,
                             egui::Layout::left_to_right(egui::Align::Min),
                             |ui| {
-                                let terminal =
+                                // Drive selection ourselves before TerminalView paints.
+                                // egui_term skips SelectStart when the PTY has MOUSE_MODE
+                                // (Ink/cursor-agent), so drag-select would otherwise no-op.
+                                let term_origin = ui.cursor().min;
+                                let term_rect =
+                                    egui::Rect::from_min_size(term_origin, term_size);
+                                drive_term_selection(ui, session, term_rect);
+
+                                // PageUp/Down scroll scrollback (egui_term only
+                                // forwards those keys as CSI to the PTY).
+                                let alt_screen = session
+                                    .backend
+                                    .last_content()
+                                    .terminal_mode
+                                    .contains(TerminalMode::ALT_SCREEN);
+                                if session.alive && term_focus {
+                                    handle_term_page_scroll(
+                                        ui,
+                                        &mut session.backend,
+                                        alt_screen,
+                                    );
+                                }
+
+                                let mut terminal =
                                     TerminalView::new(ui, &mut session.backend)
                                         .set_focus(session.alive && term_focus)
                                         .set_font(term_font.clone())
                                         .set_theme(term_theme.clone())
                                         .set_size(term_size);
+                                // Don't also send PageUp/Down to the PTY while
+                                // we own them for scrollback (primary screen).
+                                if !alt_screen {
+                                    terminal = terminal
+                                        .add_bindings(term_page_scroll_bindings());
+                                }
                                 let term_response = ui.add(terminal);
+                                auto_copy_term_selection(ui, session, &term_response);
                                 // egui_term ignores CSI ? 25 l and always paints the
                                 // grid cursor. cursor-agent hides the real caret and
                                 // draws its own, leaving a rogue block at the bottom.
@@ -1555,16 +2007,13 @@ impl eframe::App for App {
         vidya::apply(ctx, &self.theme);
 
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.sessions.clear();
-            self.active = None;
-            let _ = self.chat_watch_tx.send(Vec::new());
-            self.last_chat_watch.clear();
-            self.cancel_pending_spawn();
+            self.shutdown_all_sessions();
         }
 
-        self.poll_pty_events();
+        self.poll_pty_events(ctx);
         self.drain_resume_load();
         self.drain_pending_spawn(ctx);
+        self.drain_convert();
         self.poll_subagents(ctx);
         self.progress_composer_seeds(ctx);
         // Before widgets read input, so we can steal Paste events / attach images.
@@ -1576,6 +2025,7 @@ impl eframe::App for App {
         self.show_new_dialog(ctx);
         self.show_resume_dialog(ctx);
         self.show_rename_dialog(ctx);
+        self.show_convert_dialog(ctx);
     }
 }
 
@@ -1662,38 +2112,21 @@ fn truncate_ui(s: &str, max: usize) -> String {
     }
 }
 
-/// Multi-line session summary above the terminal — goal, work items, closing note.
+/// First non-empty line of a snippet, truncated for history rows.
+fn first_line_preview(s: &str, max: usize) -> String {
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    truncate_ui(line, max)
+}
+
+/// Session story above the terminal — casual narrator prose about the whole turn.
 fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &crate::session::AgentSession) {
-    let live = session.has_activity();
-    let waiting = session.needs_input();
-    let status = if !session.alive {
-        "Exited"
-    } else if waiting {
-        session
-            .activity
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Waiting for input")
-    } else if live {
-        session
-            .activity
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Working…")
-    } else {
-        "Idle"
-    };
-
     let summary = session.summary.as_ref().filter(|s| !s.is_empty());
-    let accent = if live {
-        theme.palette.accent
-    } else if waiting {
-        theme.palette.warning
-    } else {
-        theme.palette.border
-    };
-
-    let max_h = (ui.available_height() * 0.38).clamp(96.0, 220.0);
+    let muted = mix_rgb(theme.palette.text_secondary, theme.palette.text, 0.45);
+    let max_h = (ui.available_height() * 0.28).clamp(72.0, 160.0);
 
     egui::Frame::NONE
         .fill(theme.palette.card_bg)
@@ -1706,147 +2139,295 @@ fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &crate::session
             ui.set_min_width(ui.available_width());
             ui.set_max_height(max_h);
 
-            // Accent rule — marks this as session chrome, not a toast.
-            let (rule, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 2.0),
-                egui::Sense::hover(),
-            );
-            ui.painter()
-                .rect_filled(rule, theme.spacing.radius_sm, accent);
-            ui.add_space(theme.spacing.sm);
+            let prose = match summary {
+                Some(summary) if !summary.prose.trim().is_empty() => summary.prose.as_str(),
+                _ if session.alive => "quiet so far — nothing cooking yet.",
+                _ => "nothing happened in this session.",
+            };
+            let empty = summary.is_none_or(|s| s.prose.trim().is_empty());
+            let color = if empty { muted } else { theme.palette.text };
+            let job = summary_markdown_job(prose, theme, color, empty);
 
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = theme.spacing.sm;
-                vidya::status_dot(ui, theme, live || (waiting && session.alive));
-                ui.label(
-                    egui::RichText::new(status)
-                        .size(theme.type_scale.caption)
-                        .strong()
-                        .color(if live {
-                            theme.palette.accent
-                        } else if waiting && session.alive {
-                            theme.palette.warning
-                        } else {
-                            theme.palette.text_secondary
-                        }),
-                );
-                if let Some(ws) = session.workspace.file_name().and_then(|n| n.to_str()) {
-                    ui.label(
-                        egui::RichText::new("·")
-                            .size(theme.type_scale.caption)
-                            .color(theme.palette.text_disabled),
-                    );
-                    ui.label(
-                        egui::RichText::new(ws)
-                            .size(theme.type_scale.caption)
-                            .color(theme.palette.text_disabled),
-                    );
-                }
-            });
-
-            match summary {
-                Some(summary) => paint_summary_body(ui, theme, summary),
-                None => {
-                    ui.add_space(theme.spacing.xs);
-                    ui.label(
-                        egui::RichText::new(if session.alive {
-                            "Session just started — work will show up here."
-                        } else {
-                            "No summary for this session."
-                        })
-                        .size(theme.type_scale.body)
-                        .italics()
-                        .color(theme.palette.text_secondary),
-                    );
-                }
-            }
+            egui::ScrollArea::vertical()
+                .max_height(max_h - theme.spacing.sm * 2.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.add(egui::Label::new(job).wrap());
+                });
         });
 }
 
-fn paint_summary_body(ui: &mut egui::Ui, theme: &Theme, summary: &SessionSummary) {
-    if let Some(goal) = summary.goal.as_deref() {
-        ui.add_space(theme.spacing.sm);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(goal)
-                    .size(theme.type_scale.title_2)
-                    .strong()
-                    .color(theme.palette.text),
-            )
-            .wrap(),
+/// Lightweight markdown → [`LayoutJob`] for the summary panel.
+///
+/// Supports ATX headings (`#`–`###`), bullet / numbered lists, paragraphs,
+/// and inline `**bold**`, `*italic*` / `_italic_`, and `` `code` ``.
+fn summary_markdown_job(
+    md: &str,
+    theme: &Theme,
+    color: egui::Color32,
+    force_italic: bool,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    let body = theme.type_scale.title_3.max(theme.type_scale.body);
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+    let mut first_block = true;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let line = raw.trim_end();
+        if line.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+
+        if !first_block {
+            append_formatted(&mut job, "\n\n", body_format(theme, color, body, force_italic));
+        }
+        first_block = false;
+
+        if let Some((level, title)) = parse_atx_heading(line) {
+            let size = match level {
+                1 => theme.type_scale.title,
+                2 => theme.type_scale.title_2,
+                _ => theme.type_scale.title_3,
+            };
+            let fmt = TextFormat {
+                font_id: FontId::proportional(size),
+                color: if force_italic {
+                    color
+                } else {
+                    theme.palette.text
+                },
+                italics: force_italic,
+                line_height: Some(size * 1.3),
+                ..Default::default()
+            };
+            append_inline_markdown(&mut job, title, theme, fmt, force_italic);
+            i += 1;
+            continue;
+        }
+
+        if let Some((marker, item)) = parse_list_item(line) {
+            let fmt = body_format(theme, color, body, force_italic);
+            append_formatted(&mut job, marker, fmt.clone());
+            append_inline_markdown(&mut job, item, theme, fmt, force_italic);
+            i += 1;
+            while i < lines.len() {
+                let next = lines[i].trim_end();
+                if next.trim().is_empty() {
+                    break;
+                }
+                let Some((marker, item)) = parse_list_item(next) else {
+                    break;
+                };
+                append_formatted(
+                    &mut job,
+                    "\n",
+                    body_format(theme, color, body, force_italic),
+                );
+                let fmt = body_format(theme, color, body, force_italic);
+                append_formatted(&mut job, marker, fmt.clone());
+                append_inline_markdown(&mut job, item, theme, fmt, force_italic);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Paragraph: join soft-wrapped continuation lines until blank / block.
+        let mut para = line.trim_start().to_string();
+        i += 1;
+        while i < lines.len() {
+            let next = lines[i].trim_end();
+            if next.trim().is_empty()
+                || parse_atx_heading(next).is_some()
+                || parse_list_item(next).is_some()
+            {
+                break;
+            }
+            para.push(' ');
+            para.push_str(next.trim());
+            i += 1;
+        }
+        append_inline_markdown(
+            &mut job,
+            &para,
+            theme,
+            body_format(theme, color, body, force_italic),
+            force_italic,
         );
     }
 
-    if !summary.lines.is_empty() {
-        ui.add_space(theme.spacing.sm);
-        let label_w = measure_kind_column(ui, theme, &summary.lines);
-        for line in &summary.lines {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = theme.spacing.md;
-                let kind_color = kind_color(theme, line.kind);
-                ui.add_sized(
-                    egui::vec2(label_w, theme.type_scale.body),
-                    egui::Label::new(
-                        egui::RichText::new(line.kind.label())
-                            .size(theme.type_scale.caption)
-                            .strong()
-                            .color(kind_color),
-                    ),
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&line.text)
-                            .size(theme.type_scale.body)
-                            .color(theme.palette.text),
-                    )
-                    .wrap(),
-                );
-            });
+    if job.is_empty() {
+        append_formatted(
+            &mut job,
+            md,
+            body_format(theme, color, body, force_italic),
+        );
+    }
+    job
+}
+
+fn body_format(
+    _theme: &Theme,
+    color: egui::Color32,
+    size: f32,
+    italic: bool,
+) -> TextFormat {
+    TextFormat {
+        font_id: FontId::proportional(size),
+        color,
+        italics: italic,
+        line_height: Some(size * 1.35),
+        ..Default::default()
+    }
+}
+
+fn parse_atx_heading(line: &str) -> Option<(u8, &str)> {
+    let trimmed = line.trim_start();
+    let mut level = 0_u8;
+    let bytes = trimmed.as_bytes();
+    while (level as usize) < bytes.len() && bytes[level as usize] == b'#' && level < 3 {
+        level += 1;
+    }
+    if level == 0 {
+        return None;
+    }
+    let rest = &trimmed[level as usize..];
+    if !rest.starts_with(' ') && !rest.is_empty() {
+        return None;
+    }
+    Some((level, rest.trim()))
+}
+
+fn parse_list_item(line: &str) -> Option<(&'static str, &str)> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        return Some(("•  ", rest));
+    }
+    // Ordered: "1. ", "12. "
+    let mut digits = 0_usize;
+    for b in trimmed.bytes() {
+        if b.is_ascii_digit() {
+            digits += 1;
+        } else {
+            break;
         }
     }
-
-    if let Some(note) = summary.note.as_deref() {
-        ui.add_space(theme.spacing.sm);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(note)
-                    .size(theme.type_scale.body)
-                    .italics()
-                    .color(theme.palette.text_secondary),
-            )
-            .wrap(),
-        );
+    if digits > 0 {
+        let after = &trimmed[digits..];
+        if let Some(rest) = after.strip_prefix(". ") {
+            return Some(("•  ", rest));
+        }
     }
+    None
 }
 
-fn measure_kind_column(
-    ui: &egui::Ui,
+fn append_inline_markdown(
+    job: &mut LayoutJob,
+    text: &str,
     theme: &Theme,
-    lines: &[crate::subagents::SummaryLine],
-) -> f32 {
-    let mut w = 0.0_f32;
-    for line in lines {
-        let galley = ui.fonts(|f| {
-            f.layout_no_wrap(
-                line.kind.label().to_string(),
-                egui::FontId::proportional(theme.type_scale.caption),
-                theme.palette.text,
-            )
-        });
-        w = w.max(galley.size().x);
+    base: TextFormat,
+    force_italic: bool,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut buf = String::new();
+
+    while i < chars.len() {
+        // `code`
+        if chars[i] == '`' {
+            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '`') {
+                if !buf.is_empty() {
+                    append_formatted(job, &buf, base.clone());
+                    buf.clear();
+                }
+                let code: String = chars[i + 1..i + 1 + end].iter().collect();
+                let mut code_fmt = base.clone();
+                code_fmt.font_id = FontId::monospace(base.font_id.size * 0.92);
+                code_fmt.color = theme.palette.accent;
+                code_fmt.background = theme.palette.popover_bg;
+                code_fmt.italics = false;
+                append_formatted(job, &format!("\u{00a0}{code}\u{00a0}"), code_fmt);
+                i += end + 2;
+                continue;
+            }
+        }
+
+        // **bold**
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(end) = find_closing(&chars, i + 2, &['*', '*']) {
+                if !buf.is_empty() {
+                    append_formatted(job, &buf, base.clone());
+                    buf.clear();
+                }
+                let inner: String = chars[i + 2..end].iter().collect();
+                let mut bold = base.clone();
+                bold.color = theme.palette.text;
+                bold.italics = force_italic;
+                // Default UI fonts lack a bold face — nudge size for weight.
+                bold.font_id = FontId::proportional(base.font_id.size + 0.5);
+                append_inline_markdown(job, &inner, theme, bold, force_italic);
+                i = end + 2;
+                continue;
+            }
+        }
+
+        // *italic* or _italic_ (single delimiter, non-empty, no newline)
+        let italic_delim = match chars[i] {
+            '*' if !(i + 1 < chars.len() && chars[i + 1] == '*') => Some('*'),
+            '_' => Some('_'),
+            _ => None,
+        };
+        if let Some(delim) = italic_delim {
+            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == delim) {
+                let end = i + 1 + rel;
+                let inner: String = chars[i + 1..end].iter().collect();
+                if !inner.is_empty() && !inner.contains('\n') {
+                    if !buf.is_empty() {
+                        append_formatted(job, &buf, base.clone());
+                        buf.clear();
+                    }
+                    let mut ital = base.clone();
+                    ital.italics = true;
+                    append_inline_markdown(job, &inner, theme, ital, true);
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        buf.push(chars[i]);
+        i += 1;
     }
-    (w + 4.0).clamp(52.0, 88.0)
+    if !buf.is_empty() {
+        append_formatted(job, &buf, base);
+    }
 }
 
-fn kind_color(theme: &Theme, kind: SummaryKind) -> egui::Color32 {
-    match kind {
-        SummaryKind::Edited => theme.palette.accent,
-        SummaryKind::Ran => theme.palette.success,
-        SummaryKind::Searched => theme.palette.warning,
-        SummaryKind::Read => theme.palette.text_secondary,
-        SummaryKind::Delegated => theme.palette.accent_hover,
-        SummaryKind::Other => theme.palette.text_secondary,
+fn find_closing(chars: &[char], from: usize, delim: &[char]) -> Option<usize> {
+    let n = delim.len();
+    let mut i = from;
+    while i + n <= chars.len() {
+        if chars[i..i + n] == *delim {
+            return Some(i);
+        }
+        i += 1;
     }
+    None
+}
+
+fn append_formatted(job: &mut LayoutJob, text: impl AsRef<str>, format: TextFormat) {
+    job.append(text.as_ref(), 0.0, format);
+}
+
+fn mix_rgb(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| -> u8 {
+        ((x as f32) * (1.0 - t) + (y as f32) * t).round() as u8
+    };
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 fn chat_poller_loop(
@@ -1893,6 +2474,175 @@ fn term_font_id() -> FontId {
         TERM_FONT_SIZE,
         FontFamily::Name(TERM_FONT_NAME.into()),
     )
+}
+
+/// Auto-copy terminal selection when the user finishes a select gesture
+/// (drag release, or double/triple-click word/line select).
+///
+/// egui_term has no `selection.automatic_copy`; we approximate alacritty's.
+///
+/// Important: `TerminalView` uses `Sense::click()` only, so `Response::hovered`
+/// often goes false mid-drag. We arm on press-over-term and decide on release
+/// from the actual selection range (and egui's drag/click flags).
+fn auto_copy_term_selection(
+    ui: &mut egui::Ui,
+    session: &mut AgentSession,
+    term_response: &egui::Response,
+) {
+    let (primary_released, decidedly_dragging) = ui.input(|i| {
+        (
+            i.pointer.primary_released(),
+            i.pointer.is_decidedly_dragging(),
+        )
+    });
+
+    if !primary_released {
+        return;
+    }
+
+    let armed = session.term_select_armed;
+    let dragged = session.term_select_dragging || decidedly_dragging;
+    let multi_click = term_response.double_clicked() || term_response.triple_clicked();
+    session.term_select_armed = false;
+    session.term_select_dragging = false;
+
+    if !armed {
+        return;
+    }
+
+    // Force a sync so selectable_range matches SelectUpdate we applied this frame.
+    session.backend.sync();
+
+    let multi_cell = session
+        .backend
+        .last_content()
+        .selectable_range
+        .is_some_and(|r| r.start != r.end);
+
+    if !dragged && !multi_click && !multi_cell {
+        return;
+    }
+
+    let text = term_selection_text(&session.backend);
+    if text.is_empty() {
+        return;
+    }
+    ui.ctx().copy_text(text);
+}
+
+/// Start/update grid selection even when egui_term refuses (MOUSE_MODE).
+///
+/// Must run *before* `TerminalView` so `show()` paints the updated range.
+fn drive_term_selection(
+    ui: &mut egui::Ui,
+    session: &mut AgentSession,
+    term_rect: egui::Rect,
+) {
+    let (primary_pressed, primary_down, primary_released, decidedly_dragging, pointer_pos) =
+        ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.is_decidedly_dragging(),
+                i.pointer.interact_pos().or(i.pointer.hover_pos()),
+            )
+        });
+
+    let Some(pos) = pointer_pos else {
+        if !primary_down && !primary_released {
+            session.term_select_armed = false;
+            session.term_select_dragging = false;
+        }
+        return;
+    };
+
+    let over = term_rect.contains(pos);
+    let rel = pos - term_rect.min;
+
+    if primary_pressed && over {
+        session.term_select_armed = true;
+        session.term_select_dragging = false;
+        session.backend.process_command(BackendCommand::SelectStart(
+            SelectionType::Simple,
+            rel.x,
+            rel.y,
+        ));
+        return;
+    }
+
+    if !session.term_select_armed {
+        return;
+    }
+
+    if primary_down {
+        if decidedly_dragging {
+            session.term_select_dragging = true;
+        }
+        // Keep updating while armed so MOUSE_MODE sessions still highlight.
+        if session.term_select_dragging || decidedly_dragging || over {
+            session.backend.process_command(BackendCommand::SelectUpdate(rel.x, rel.y));
+        }
+        return;
+    }
+
+    if primary_released {
+        if decidedly_dragging {
+            session.term_select_dragging = true;
+        }
+        // Final update so the release cell is included; double/triple-click is
+        // handled afterward by TerminalView (Semantic/Lines SelectStart).
+        if session.term_select_dragging || decidedly_dragging {
+            session.backend.process_command(BackendCommand::SelectUpdate(rel.x, rel.y));
+        }
+        return;
+    }
+
+    // Button no longer down and we missed release (focus loss, etc.).
+    session.term_select_armed = false;
+    session.term_select_dragging = false;
+}
+
+/// Selected cells as a string, with newlines between grid rows and trailing
+/// spaces stripped (egui_term's `selectable_content` concatenates with neither).
+fn term_selection_text(backend: &egui_term::TerminalBackend) -> String {
+    let content = backend.last_content();
+    let Some(range) = content.selectable_range else {
+        return String::new();
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current: Option<(i32, String)> = None;
+
+    for indexed in content.grid.display_iter() {
+        if !range.contains(indexed.point) {
+            continue;
+        }
+        let line = indexed.point.line.0;
+        match current.as_mut() {
+            Some((l, buf)) if *l == line => buf.push(indexed.c),
+            Some(_) => {
+                let (_, prev) = current.take().unwrap();
+                lines.push(trim_trailing_ws(prev));
+                current = Some((line, indexed.c.to_string()));
+            }
+            None => current = Some((line, indexed.c.to_string())),
+        }
+    }
+    if let Some((_, prev)) = current {
+        lines.push(trim_trailing_ws(prev));
+    }
+
+    let text = lines.join("\n");
+    if text.chars().all(|c| c.is_whitespace()) {
+        String::new()
+    } else {
+        text
+    }
+}
+
+fn trim_trailing_ws(s: String) -> String {
+    s.trim_end_matches(|c: char| c == ' ' || c == '\t').to_string()
 }
 
 /// Paint over the PTY cursor cell when the app has hidden it (`TermMode::SHOW_CURSOR`
@@ -1942,6 +2692,72 @@ fn cover_hidden_pty_cursor(
         0.0,
         theme.get_color(Color::Named(NamedColor::Background)),
     );
+}
+
+/// Bindings that keep PageUp/Down out of the PTY on the primary screen so
+/// [`handle_term_page_scroll`] can drive scrollback instead.
+fn term_page_scroll_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
+    let none = egui::Modifiers::NONE;
+    let shift = egui::Modifiers::SHIFT;
+    [
+        (egui::Key::PageUp, none),
+        (egui::Key::PageDown, none),
+        (egui::Key::PageUp, shift),
+        (egui::Key::PageDown, shift),
+    ]
+    .into_iter()
+    .map(|(key, modifiers)| {
+        (
+            Binding {
+                target: InputKind::KeyCode(key),
+                modifiers,
+                terminal_mode_include: TerminalMode::empty(),
+                terminal_mode_exclude: TerminalMode::empty(),
+            },
+            BindingAction::Ignore,
+        )
+    })
+    .collect()
+}
+
+/// PageUp/Down (and Shift+) scroll one screen of history when not in alt-screen.
+///
+/// egui_term sends bare PageUp/Down to the child and leaves Shift+PageUp/Down
+/// unbound outside alt-screen, so scrollback keys never moved the viewport.
+fn handle_term_page_scroll(
+    ui: &mut egui::Ui,
+    backend: &mut egui_term::TerminalBackend,
+    alt_screen: bool,
+) {
+    use alacritty_terminal::grid::Dimensions;
+
+    if alt_screen {
+        return;
+    }
+
+    let (page_up, page_down) = ui.input(|i| {
+        let mods = i.modifiers;
+        // Leave Ctrl/Alt chords to egui_term (CSI with modifier params).
+        if mods.ctrl || mods.alt || mods.command {
+            return (false, false);
+        }
+        (
+            i.key_pressed(egui::Key::PageUp),
+            i.key_pressed(egui::Key::PageDown),
+        )
+    });
+    if !page_up && !page_down {
+        return;
+    }
+
+    let screen_lines = backend.last_content().grid.screen_lines().max(1);
+    let scroll_delta = if page_up {
+        screen_lines as i32
+    } else {
+        -(screen_lines as i32)
+    };
+    backend.process_command(BackendCommand::Scroll(scroll_delta));
+    ui.ctx().request_repaint();
 }
 
 /// Scrollback scrollbar for an egui_term PTY (egui_term has no built-in bar).
@@ -2052,16 +2868,35 @@ fn show_term_scrollbar(
 }
 
 /// Register JetBrains Mono under its own family so egui_term never picks up
-/// vidya’s proportional `→` fallback on `FontFamily::Monospace`.
+/// vidya’s proportional `→` fallback on `FontFamily::Monospace`, then attach
+/// symbol/emoji supplements for cursor-agent icons (`⌕`, `🔍`, …).
 fn install_term_font(ctx: &egui::Context) {
-    ctx.add_font(FontInsert::new(
-        TERM_FONT_NAME,
-        FontData::from_static(TERM_FONT_TTF),
-        vec![InsertFontFamily {
-            family: FontFamily::Name(TERM_FONT_NAME.into()),
-            priority: FontPriority::Highest,
-        }],
-    ));
+    let mut fonts = FontDefinitions::default();
+
+    fonts.font_data.insert(
+        TERM_FONT_NAME.to_owned(),
+        FontData::from_static(TERM_FONT_TTF).into(),
+    );
+    fonts.font_data.insert(
+        TERM_SYMBOLS_NAME.to_owned(),
+        FontData::from_static(TERM_SYMBOLS_TTF).into(),
+    );
+
+    // Isolated family: JB first (mono advances), then our symbol subset, then
+    // egui’s built-in emoji/Hack fallbacks. Do not use FontFamily::Monospace —
+    // vidya installs a proportional symbol font there that breaks cell width.
+    fonts.families.insert(
+        FontFamily::Name(TERM_FONT_NAME.into()),
+        vec![
+            TERM_FONT_NAME.to_owned(),
+            TERM_SYMBOLS_NAME.to_owned(),
+            "NotoEmoji-Regular".to_owned(),
+            "emoji-icon-font".to_owned(),
+            "Hack".to_owned(),
+        ],
+    );
+
+    ctx.set_fonts(fonts);
 }
 
 fn vidya_term_theme() -> TerminalTheme {

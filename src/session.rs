@@ -2,6 +2,7 @@
 
 use crate::subagents::{self, ChatSnapshot, SessionSummary, Subagent};
 use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,7 +31,7 @@ pub struct PreparedSession {
     pub composer_seed: Option<ComposerSeed>,
 }
 
-/// Initial composer contents deferred until the agent TUI can accept paste/input.
+/// Initial composer contents deferred until the agent TUI can accept input.
 #[derive(Debug, Clone)]
 pub struct ComposerSeed {
     pub images: Vec<PathBuf>,
@@ -42,9 +43,13 @@ pub struct ComposerSeed {
 pub struct ComposerSeedInject {
     images: Vec<PathBuf>,
     prompt: String,
-    /// `0..images.len()` paste that image; then type prompt; then submit if prompt set.
+    /// How many images have had clipboard+`^V` sent (await `[Image #N]` before the next).
+    pastes_sent: usize,
+    /// After all pastes attach: 0 = type prompt, 1 = submit.
     step: usize,
     next_at: Instant,
+    /// When the inject was armed (so we can stop waiting on "Starting…").
+    started_at: Instant,
 }
 
 /// Draft fields for the new-session / resume dialogs.
@@ -110,13 +115,19 @@ pub struct AgentSession {
     pub workspace: PathBuf,
     pub backend: TerminalBackend,
     pub alive: bool,
+    /// Direct child PID of the PTY shell (`cursor-agent`), if known.
+    ///
+    /// Used to kill the agent *before* dropping [`TerminalBackend`]: egui_term's
+    /// subscriber only exits on `Event::Exit` (sent when the child exits). Dropping
+    /// first sends `Shutdown` and busy-spins the subscriber thread forever.
+    pub child_pid: Option<u32>,
     /// Cursor chat id (`create-chat` or resume); used for title + subagent polling.
     pub chat_id: String,
     /// Nested Task/subagents discovered under this chat.
     pub subagents: Vec<Subagent>,
     /// Live status for spinner / needs-input (e.g. "Thinking…").
     pub activity: Option<String>,
-    /// Structured retrospective of work done (summary panel).
+    /// Casual narrator story of this turn for the summary panel.
     pub summary: Option<SessionSummary>,
     /// Latest chat meta title from the poller (kept even when [`Self::title_locked`]).
     pub meta_title: Option<String>,
@@ -128,6 +139,11 @@ pub struct AgentSession {
     last_activity: Option<Instant>,
     /// Paste images + type prompt into the interactive composer once the TUI is ready.
     composer_seed: Option<ComposerSeedInject>,
+    /// True while the pointer is dragging a text selection in this session's terminal.
+    /// Used to auto-copy on release (egui_term has no built-in automatic_copy).
+    pub term_select_dragging: bool,
+    /// Primary was pressed while the pointer was over this terminal (may lose hover mid-drag).
+    pub term_select_armed: bool,
 }
 
 impl AgentSession {
@@ -160,6 +176,7 @@ impl AgentSession {
 
         // Interactive TUI ignores `--image` (headless-only). When images were pasted in
         // the new-session dialog, withhold the CLI prompt too and inject both via PTY.
+        let title_from_prompt = sanitize_auto_title(draft.prompt.trim());
         let composer_seed = if draft.images.is_empty() {
             None
         } else {
@@ -177,7 +194,7 @@ impl AgentSession {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .or_else(|| sanitize_auto_title(draft.prompt.trim()))
+            .or(title_from_prompt)
             .unwrap_or_else(|| {
                 workspace
                     .file_name()
@@ -203,6 +220,8 @@ impl AgentSession {
         pty_tx: Sender<(u64, PtyEvent)>,
         prepared: PreparedSession,
     ) -> Result<Self, String> {
+        let parent = std::process::id();
+        let before = direct_child_pids(parent);
         let backend = TerminalBackend::new(
             id,
             ctx,
@@ -214,6 +233,8 @@ impl AgentSession {
             },
         )
         .map_err(|e| format!("failed to spawn agent PTY: {e}"))?;
+        let after = direct_child_pids(parent);
+        let child_pid = after.difference(&before).next().copied();
 
         Ok(Self {
             id,
@@ -221,6 +242,7 @@ impl AgentSession {
             workspace: prepared.workspace,
             backend,
             alive: true,
+            child_pid,
             chat_id: prepared.chat_id,
             subagents: Vec::new(),
             activity: Some("Starting…".into()),
@@ -229,13 +251,20 @@ impl AgentSession {
             tasks_folded: false,
             title_locked: false,
             last_activity: Some(Instant::now()),
-            composer_seed: prepared.composer_seed.map(|seed| ComposerSeedInject {
-                images: seed.images,
-                prompt: seed.prompt,
-                step: 0,
-                // Give the interactive TUI a moment to paint the composer.
-                next_at: Instant::now() + Duration::from_millis(900),
+            composer_seed: prepared.composer_seed.map(|seed| {
+                let started_at = Instant::now();
+                ComposerSeedInject {
+                    images: seed.images,
+                    prompt: seed.prompt,
+                    pastes_sent: 0,
+                    step: 0,
+                    // Give the interactive TUI time to mount the composer before we paste.
+                    next_at: started_at + Duration::from_millis(1500),
+                    started_at,
+                }
             }),
+            term_select_dragging: false,
+            term_select_armed: false,
         })
     }
 
@@ -244,9 +273,13 @@ impl AgentSession {
         self.composer_seed.is_some()
     }
 
-    /// Advance clipboard/`^V`/prompt injection for images pasted on the new-session screen.
+    /// Advance clipboard-`^V` + prompt injection for images pasted on the new-session screen.
     ///
     /// Returns how long to wait before the next step (for `request_repaint_after`).
+    ///
+    /// Puts each image on the system clipboard and sends `^V` (same path as a manual
+    /// Ctrl+V). Waits until `[Image #N]` appears in the TUI before typing the prompt or
+    /// submitting, so the agent's async paste handler can finish.
     pub fn progress_composer_seed(&mut self) -> Option<Duration> {
         let Some(inject) = self.composer_seed.as_mut() else {
             return None;
@@ -261,45 +294,71 @@ impl AgentSession {
             return Some(inject.next_at.saturating_duration_since(now));
         }
 
+        // Hold off while the agent is still booting the composer (cap so a stuck
+        // "Starting…" label cannot block the seed forever).
+        if inject.pastes_sent == 0
+            && inject.step == 0
+            && self.activity.as_deref() == Some("Starting…")
+            && inject.started_at.elapsed() < Duration::from_secs(8)
+        {
+            inject.next_at = Instant::now() + Duration::from_millis(250);
+            return Some(Duration::from_millis(250));
+        }
+
         let img_count = inject.images.len();
-        if inject.step < img_count {
-            let path = inject.images[inject.step].clone();
+        let attached = terminal_image_token_count(&mut self.backend);
+
+        // Send next clipboard paste once prior attaches have landed.
+        if inject.pastes_sent < img_count && attached >= inject.pastes_sent {
+            let path = inject.images[inject.pastes_sent].clone();
             if crate::clipboard::set_clipboard_image(&path) {
                 self.backend
                     .process_command(BackendCommand::Write(vec![0x16]));
             }
-            inject.step += 1;
-            inject.next_at = Instant::now() + Duration::from_millis(180);
-            return Some(Duration::from_millis(180));
+            inject.pastes_sent += 1;
+            let wait = Duration::from_millis(50);
+            inject.next_at = Instant::now() + wait;
+            return Some(wait);
         }
 
-        if inject.step == img_count {
+        // Wait until every paste shows as `[Image #N]` in the TUI.
+        if attached < img_count {
+            if inject.started_at.elapsed() < Duration::from_secs(10) {
+                let wait = Duration::from_millis(100);
+                inject.next_at = Instant::now() + wait;
+                return Some(wait);
+            }
+            // Timed out — leave the composer open rather than submitting without images.
+            let _ = self.composer_seed.take();
+            return None;
+        }
+
+        if inject.step == 0 {
             let prompt = inject.prompt.trim();
             if !prompt.is_empty() {
                 self.backend
                     .process_command(BackendCommand::Write(prompt.as_bytes().to_vec()));
-                inject.step += 1;
-                inject.next_at = Instant::now() + Duration::from_millis(60);
-                return Some(Duration::from_millis(60));
+                inject.step = 1;
+                inject.next_at = Instant::now() + Duration::from_millis(80);
+                return Some(Duration::from_millis(80));
             }
-            // Image-only: leave the composer open for the user to add text / submit.
-            self.clear_composer_seed();
+            // Image-only: leave the composer open. Keep files — agent may still
+            // reference paths until the user submits (/tmp reclaims later).
+            let _ = self.composer_seed.take();
             return None;
         }
 
-        // Submit the seeded prompt.
+        // Prompt typed: submit. Keep clip files in case anything still references them.
         self.backend
             .process_command(BackendCommand::Write(vec![b'\r']));
-        self.clear_composer_seed();
+        let _ = self.composer_seed.take();
         None
     }
 
     fn clear_composer_seed(&mut self) {
-        if let Some(inject) = self.composer_seed.take() {
-            for path in inject.images {
-                let _ = fs::remove_file(path);
-            }
-        }
+        // Drop the seed but keep image files — paste/selectedImages may still
+        // reference paths until blob ingest finishes.
+        let _ = self.composer_seed.take();
     }
 
     /// Record PTY output so the sidebar spinner stays up between chat polls.
@@ -460,6 +519,24 @@ fn title_from_terminal(backend: &mut TerminalBackend) -> Option<String> {
     lines
         .into_iter()
         .find_map(|line| sanitize_auto_title(&line))
+}
+
+/// How many `[Image #N]` tokens are visible in the agent TUI.
+fn terminal_image_token_count(backend: &mut TerminalBackend) -> usize {
+    let content = backend.sync();
+    let mut text = String::new();
+    let mut current_line: Option<i32> = None;
+    for indexed in content.grid.display_iter() {
+        let line = indexed.point.line.0;
+        if current_line.is_some() && current_line != Some(line) {
+            text.push('\n');
+        }
+        current_line = Some(line);
+        if indexed.c != '\0' {
+            text.push(indexed.c);
+        }
+    }
+    text.matches("[Image #").count()
 }
 
 fn push_terminal_line(lines: &mut Vec<String>, buf: &str) {
@@ -658,6 +735,40 @@ fn format_age(updated_at_ms: u64) -> String {
     } else {
         format!("{}d ago", secs / 86400)
     }
+}
+
+/// PIDs whose parent is `ppid` (Linux `/proc`).
+fn direct_child_pids(ppid: u32) -> HashSet<u32> {
+    let mut out = HashSet::new();
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if parent_pid(pid) == Some(ppid) {
+            out.insert(pid);
+        }
+    }
+    out
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Force-kill a PTY child so alacritty emits `Event::Exit` (egui_term subscriber exits).
+pub fn kill_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
 }
 
 fn which(name: &str) -> Option<PathBuf> {

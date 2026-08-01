@@ -46,24 +46,23 @@ pub struct ChatSnapshot {
     pub subagents: Vec<Subagent>,
     /// Live status for spinner / needs-input (e.g. "Thinking…", "Waiting for input").
     pub activity: Option<String>,
-    /// Structured retrospective of work done this turn.
+    /// Generated story paragraph for the summary panel.
     pub summary: Option<SessionSummary>,
 }
 
-/// Past-tense session recap for the summary panel.
+/// Story for the summary panel — one casual narrative about the whole turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSummary {
-    /// Latest user ask (short).
+    /// Latest user ask (short); also drives tab auto-rename.
     pub goal: Option<String>,
-    /// Discrete work items (edited files, commands, …).
-    pub lines: Vec<SummaryLine>,
-    /// Closing assistant prose when the turn has wound down.
-    pub note: Option<String>,
+    /// Cohesive narrator prose (not status, not tool history, not agent chatter).
+    /// May include light markdown: `**bold**`, `*italic*`, `` `code` ``.
+    pub prose: String,
 }
 
 impl SessionSummary {
     pub fn is_empty(&self) -> bool {
-        self.goal.is_none() && self.lines.is_empty() && self.note.is_none()
+        self.prose.trim().is_empty() && self.goal.is_none()
     }
 
     /// Best short string for tab auto-rename.
@@ -71,37 +70,10 @@ impl SessionSummary {
         self.goal
             .as_deref()
             .filter(|s| !s.is_empty())
-            .or_else(|| self.note.as_deref().filter(|s| !s.is_empty()))
-            .or_else(|| self.lines.first().map(|l| l.text.as_str()))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SummaryLine {
-    pub kind: SummaryKind,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SummaryKind {
-    Edited,
-    Ran,
-    Searched,
-    Read,
-    Delegated,
-    Other,
-}
-
-impl SummaryKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Edited => "Edited",
-            Self::Ran => "Ran",
-            Self::Searched => "Searched",
-            Self::Read => "Read",
-            Self::Delegated => "Delegated",
-            Self::Other => "Also",
-        }
+            .or_else(|| {
+                let p = self.prose.trim();
+                (!p.is_empty()).then_some(p)
+            })
     }
 }
 
@@ -196,7 +168,7 @@ pub fn poll_chat(chat_id: &str, workspace: Option<&Path>) -> ChatSnapshot {
     snap
 }
 
-/// Live status + past-tense recap from the transcript tail.
+/// Live status + story paragraph from the transcript tail.
 fn summarize_transcript(
     chat_id: &str,
     subagents: &[Subagent],
@@ -265,7 +237,7 @@ fn parse_transcript_dir(transcript_dir: &Path, chat_id: &str) -> Option<Transcri
     None
 }
 
-/// Scan the last ~128 KiB of a transcript for live status + a retrospective summary.
+/// Scan the last ~128 KiB of a transcript for live status + story prose.
 fn digest_jsonl_tail(path: &Path) -> Option<TranscriptDigest> {
     let Ok(mut file) = fs::File::open(path) else {
         return None;
@@ -293,18 +265,16 @@ fn digest_jsonl_tail(path: &Path) -> Option<TranscriptDigest> {
     }
 
     let mut last_tool: Option<String> = None;
-    let mut last_assistant_text: Option<String> = None;
+    let mut assistant_chars: usize = 0;
     let mut last_role: Option<&'static str> = None;
     let mut turn_ended = false;
-
-    // Retrospective: aggregate tools since the latest user message.
     let mut user_goal: Option<String> = None;
     let mut edited: Vec<String> = Vec::new();
     let mut ran: Vec<String> = Vec::new();
     let mut searched: Vec<String> = Vec::new();
     let mut tasks: Vec<String> = Vec::new();
     let mut read_count: usize = 0;
-    let mut other: Vec<String> = Vec::new();
+    let mut tool_events: usize = 0;
 
     for line in &lines[start_idx..] {
         let line = line.trim();
@@ -334,15 +304,14 @@ fn digest_jsonl_tail(path: &Path) -> Option<TranscriptDigest> {
             Some("user") => {
                 turn_ended = false;
                 last_tool = None;
-                last_assistant_text = None;
+                assistant_chars = 0;
                 last_role = Some("user");
-                // New turn — reset retrospective buckets.
                 edited.clear();
                 ran.clear();
                 searched.clear();
                 tasks.clear();
-                other.clear();
                 read_count = 0;
+                tool_events = 0;
                 user_goal = parts.iter().find_map(|p| {
                     if p.get("type").and_then(|v| v.as_str()) != Some("text") {
                         return None;
@@ -355,17 +324,17 @@ fn digest_jsonl_tail(path: &Path) -> Option<TranscriptDigest> {
                 turn_ended = false;
                 last_role = Some("assistant");
                 let mut tool_in_msg = None;
-                let mut text_in_msg = None;
+                let mut text_chars = 0usize;
                 for part in parts {
                     match part.get("type").and_then(|v| v.as_str()) {
                         Some("tool_use") => {
-                            record_tool_for_summary(
+                            tool_events += 1;
+                            record_tool_for_story(
                                 part,
                                 &mut edited,
                                 &mut ran,
                                 &mut searched,
                                 &mut tasks,
-                                &mut other,
                                 &mut read_count,
                             );
                             if let Some(label) = format_tool_activity(part) {
@@ -374,51 +343,49 @@ fn digest_jsonl_tail(path: &Path) -> Option<TranscriptDigest> {
                         }
                         Some("text") => {
                             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                                let t = collapse_ws(t);
-                                if !t.is_empty() {
-                                    text_in_msg = Some(t);
-                                }
+                                text_chars += collapse_ws(t).chars().count();
                             }
                         }
                         _ => {}
                     }
                 }
-                if let Some(t) = tool_in_msg {
-                    last_tool = Some(t);
-                    last_assistant_text = None;
-                } else if let Some(t) = text_in_msg {
+                assistant_chars += text_chars;
+                if let Some(tool) = tool_in_msg {
+                    last_tool = Some(tool);
+                } else if text_chars > 0 {
                     last_tool = None;
-                    last_assistant_text = Some(t);
                 }
             }
             _ => {}
         }
     }
 
-    let live_status = if turn_ended || last_role == Some("ended") {
+    let ended = turn_ended || last_role == Some("ended");
+    let live_status = if ended {
         Some("Waiting for input".into())
-    } else if let Some(tool) = last_tool {
-        Some(tool)
+    } else if let Some(ref tool) = last_tool {
+        Some(tool.clone())
     } else if last_role == Some("user") {
         Some("Thinking…".into())
-    } else if let Some(ref text) = last_assistant_text {
-        Some(truncate(&first_clause(text), 72))
+    } else if assistant_chars > 0 {
+        Some("Working…".into())
     } else {
         None
     };
 
-    let summary = build_session_summary(
-        user_goal.as_deref(),
-        &edited,
-        &ran,
-        &searched,
-        &tasks,
-        &other,
+    let summary = build_session_summary(&TurnStory {
+        goal: user_goal,
+        ended,
+        thinking: last_role == Some("user"),
+        edited,
+        ran,
+        searched,
+        tasks,
         read_count,
-        last_assistant_text
-            .as_deref()
-            .filter(|_| turn_ended || last_role == Some("ended")),
-    );
+        tool_events,
+        assistant_chars,
+        last_tool,
+    });
 
     Some(TranscriptDigest {
         live_status,
@@ -450,13 +417,27 @@ fn extract_user_goal(text: &str) -> Option<String> {
     }
 }
 
-fn record_tool_for_summary(
+/// Facts from the current turn used to generate narrator prose.
+struct TurnStory {
+    goal: Option<String>,
+    ended: bool,
+    thinking: bool,
+    edited: Vec<String>,
+    ran: Vec<String>,
+    searched: Vec<String>,
+    tasks: Vec<String>,
+    read_count: usize,
+    tool_events: usize,
+    assistant_chars: usize,
+    last_tool: Option<String>,
+}
+
+fn record_tool_for_story(
     part: &Value,
     edited: &mut Vec<String>,
     ran: &mut Vec<String>,
     searched: &mut Vec<String>,
     tasks: &mut Vec<String>,
-    other: &mut Vec<String>,
     read_count: &mut usize,
 ) {
     let Some(name) = part.get("name").and_then(|v| v.as_str()) else {
@@ -477,7 +458,7 @@ fn record_tool_for_summary(
         }
         "Delete" => {
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("file");
-            push_unique(edited, format!("−{}", basename(path)));
+            push_unique(edited, basename(path));
         }
         "Shell" | "Bash" => {
             let cmd = input
@@ -508,14 +489,7 @@ fn record_tool_for_summary(
                 .unwrap_or("task");
             push_unique(tasks, truncate(desc, 36));
         }
-        "WebSearch" | "WebFetch" => {
-            push_unique(other, "Looked up web".into());
-        }
-        "AskQuestion" => {}
-        "TodoWrite" | "AwaitShell" | "Await" => {}
-        other_name => {
-            push_unique(other, format!("Used {other_name}"));
-        }
+        _ => {}
     }
 }
 
@@ -525,77 +499,19 @@ fn push_unique(list: &mut Vec<String>, item: String) {
     }
 }
 
-fn build_session_summary(
-    user_goal: Option<&str>,
-    edited: &[String],
-    ran: &[String],
-    searched: &[String],
-    tasks: &[String],
-    other: &[String],
-    read_count: usize,
-    closing_text: Option<&str>,
-) -> Option<SessionSummary> {
-    let mut lines: Vec<SummaryLine> = Vec::new();
-
-    if !edited.is_empty() {
-        lines.push(SummaryLine {
-            kind: SummaryKind::Edited,
-            text: join_and(edited, 5),
-        });
-    }
-    if !ran.is_empty() {
-        let label_text = join_and(ran, 3);
-        lines.push(SummaryLine {
-            kind: SummaryKind::Ran,
-            text: if looks_like_check(ran) && !edited.is_empty() {
-                format!("verified with {label_text}")
-            } else {
-                label_text
-            },
-        });
-    }
-    if !searched.is_empty() {
-        lines.push(SummaryLine {
-            kind: SummaryKind::Searched,
-            text: join_and(searched, 3),
-        });
-    }
-    if read_count > 0 {
-        lines.push(SummaryLine {
-            kind: SummaryKind::Read,
-            text: if read_count == 1 {
-                "1 file".into()
-            } else {
-                format!("{read_count} files")
-            },
-        });
-    }
-    if !tasks.is_empty() {
-        lines.push(SummaryLine {
-            kind: SummaryKind::Delegated,
-            text: join_and(tasks, 3),
-        });
-    }
-    for o in other.iter().take(3) {
-        lines.push(SummaryLine {
-            kind: SummaryKind::Other,
-            text: o.clone(),
-        });
-    }
-
-    let note = closing_text
-        .map(|t| truncate(&first_clause(t), 220))
-        .filter(|c| c.chars().count() >= 12);
-
-    let goal = user_goal
+/// Generate one casual narrator paragraph about the whole turn.
+fn build_session_summary(story: &TurnStory) -> Option<SessionSummary> {
+    let goal = story
+        .goal
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| truncate(s, 140));
 
+    let prose = compose_story(story);
     let summary = SessionSummary {
         goal,
-        lines,
-        note,
+        prose,
     };
     if summary.is_empty() {
         None
@@ -604,27 +520,300 @@ fn build_session_summary(
     }
 }
 
-fn looks_like_check(ran: &[String]) -> bool {
-    ran.iter().any(|c| {
-        let l = c.to_lowercase();
-        l.contains("check")
-            || l.contains("test")
-            || l.contains("build")
-            || l.contains("lint")
-            || l.contains("clippy")
-            || l.contains("tsc")
-            || l.contains("pytest")
-            || l.contains("npm test")
-            || l.contains("cargo t")
-    })
+/// Casual companion voice — one cohesive scene, not status or tool history.
+///
+/// Example shape: "it looks like we're working pretty hard on that streaming
+/// bug it looks kinda complicated. maybe 5 more minutes left on the build by
+/// the looks of it"
+fn compose_story(story: &TurnStory) -> String {
+    let topic = story
+        .goal
+        .as_deref()
+        .map(casual_topic)
+        .filter(|t| !t.is_empty());
+    if topic.is_none() && story.tool_events == 0 && !story.ended && !story.thinking {
+        return String::new();
+    }
+
+    let seed = story_seed(story);
+    let intense = story.tool_events >= 5 || story.assistant_chars > 500 || story.read_count >= 6;
+    let mut beats: Vec<String> = Vec::new();
+
+    if let Some(ref topic) = topic {
+        let topic_md = md_bold(topic);
+        if story.ended {
+            beats.push(pick(
+                seed,
+                &[
+                    format!("looks like we wrapped up {topic_md}"),
+                    format!("seems we got through {topic_md}"),
+                    format!("alright, {topic_md} is settled for now"),
+                ],
+            ));
+            if !story.edited.is_empty() {
+                beats.push(format!(
+                    "touched {} along the way",
+                    join_soft_code(&story.edited, 3)
+                ));
+            } else if looks_like_build_cmds(&story.ran) {
+                beats.push("build came through clean by the looks of it".into());
+            } else if intense {
+                beats.push("it got a little tangled but we made it through".into());
+            }
+        } else if story.thinking && story.tool_events == 0 {
+            beats.push(pick(
+                seed,
+                &[
+                    format!("just got {topic_md} on the table. still thinking it through"),
+                    format!("looking at {topic_md}. nothing moving yet"),
+                    format!("fresh ask about {topic_md} — still getting oriented"),
+                ],
+            ));
+        } else if intense {
+            beats.push(pick(
+                seed,
+                &[
+                    format!("it looks like we're working pretty hard on {topic_md}"),
+                    format!("we're pretty deep into {topic_md}"),
+                    format!("still grinding on {topic_md}"),
+                ],
+            ));
+            beats.push(pick(
+                seed + 1,
+                &[
+                    "it looks kinda complicated".into(),
+                    "there's a lot tangled up in it".into(),
+                    "not a small one by the looks of it".into(),
+                ],
+            ));
+            if let Some(activity) = activity_beat(story, seed + 2) {
+                beats.push(activity);
+            }
+        } else {
+            beats.push(pick(
+                seed,
+                &[
+                    format!("we're working through {topic_md}"),
+                    format!("making our way through {topic_md}"),
+                    format!("chewing on {topic_md}"),
+                ],
+            ));
+            if let Some(activity) = activity_beat(story, seed + 2) {
+                beats.push(activity);
+            }
+        }
+    } else if story.ended {
+        beats.push("looks like this turn wound down".into());
+    } else if let Some(activity) = activity_beat(story, seed) {
+        beats.push(format!("something's cooking — {activity}"));
+    } else {
+        beats.push("something's going on in this session".into());
+    }
+
+    weave_beats(beats)
 }
 
-fn join_and(items: &[String], max: usize) -> String {
-    let shown = if items.len() > max {
-        max
+fn activity_beat(story: &TurnStory, seed: u64) -> Option<String> {
+    let last = story.last_tool.as_deref().unwrap_or("");
+    let building = looks_like_build_cmds(&story.ran)
+        || last.to_lowercase().contains("cargo")
+        || last.to_lowercase().contains("npm")
+        || last.to_lowercase().contains("build")
+        || last.to_lowercase().contains("test")
+        || last.to_lowercase().contains("pytest")
+        || last.to_lowercase().contains("running ");
+
+    if building {
+        return Some(pick(
+            seed,
+            &[
+                "maybe a few more minutes left on the build by the looks of it".into(),
+                "looks like a build is still cooking".into(),
+                "waiting on the build to finish up".into(),
+            ],
+        ));
+    }
+    if !story.tasks.is_empty() {
+        return Some(format!(
+            "got {} running in the background",
+            join_soft_em(&story.tasks, 2)
+        ));
+    }
+    if !story.edited.is_empty() {
+        return Some(format!(
+            "poking at {} right now",
+            join_soft_code(&story.edited, 2)
+        ));
+    }
+    if !story.searched.is_empty() {
+        return Some("still hunting through the code for it".into());
+    }
+    if story.read_count > 0 {
+        return Some(pick(
+            seed,
+            &[
+                "reading through the relevant bits".into(),
+                "still getting the lay of the land".into(),
+            ],
+        ));
+    }
+    if last.to_lowercase().contains("waiting for answer") {
+        return Some("parked waiting on an answer from you".into());
+    }
+    None
+}
+
+fn weave_beats(beats: Vec<String>) -> String {
+    let beats: Vec<String> = beats
+        .into_iter()
+        .map(|b| b.trim().trim_end_matches('.').to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    if beats.is_empty() {
+        return String::new();
+    }
+    // Keep a spoken rhythm: first beat soft-joined, later ones as follow-on sentences.
+    let mut out = beats[0].clone();
+    for (i, beat) in beats.iter().enumerate().skip(1) {
+        if i == 1 && !beat.chars().next().is_some_and(|c| c.is_uppercase()) {
+            // casual run-on like the example ("…bug it looks kinda complicated")
+            out.push(' ');
+            out.push_str(beat);
+        } else {
+            out.push_str(". ");
+            out.push_str(beat);
+        }
+    }
+    ensure_sentence(&out)
+}
+
+fn casual_topic(goal: &str) -> String {
+    let g = collapse_ws(goal).to_lowercase();
+    let g = g.trim_end_matches(['.', '!', '?']).trim();
+    if g.is_empty() {
+        return String::new();
+    }
+    let stripped = strip_imperative_prefix(g);
+    let topic = if stripped.chars().count() > 48 {
+        truncate_words(stripped, 48)
     } else {
-        items.len()
+        stripped.to_string()
     };
+    if topic.starts_with("that ")
+        || topic.starts_with("the ")
+        || topic.starts_with("a ")
+        || topic.starts_with("an ")
+        || topic.starts_with("our ")
+        || topic.starts_with("my ")
+        || topic.starts_with("this ")
+    {
+        topic
+    } else {
+        format!("that {topic}")
+    }
+}
+
+fn strip_imperative_prefix(s: &str) -> &str {
+    const PREFIXES: &[&str] = &[
+        "can you ",
+        "could you ",
+        "please ",
+        "help me ",
+        "i want you to ",
+        "i need you to ",
+        "fix the ",
+        "fix a ",
+        "fix an ",
+        "fix ",
+        "add a ",
+        "add an ",
+        "add the ",
+        "add ",
+        "make a ",
+        "make an ",
+        "make the ",
+        "make ",
+        "build a ",
+        "build an ",
+        "build the ",
+        "build ",
+        "create a ",
+        "create an ",
+        "create the ",
+        "create ",
+        "implement a ",
+        "implement the ",
+        "implement ",
+        "update the ",
+        "update a ",
+        "update ",
+        "rewrite the ",
+        "rewrite ",
+        "refactor the ",
+        "refactor ",
+        "improve the ",
+        "improve ",
+        "change the ",
+        "change ",
+        "remove the ",
+        "remove ",
+        "investigate the ",
+        "investigate ",
+        "look into the ",
+        "look into ",
+        "work on the ",
+        "work on ",
+    ];
+    let mut rest = s;
+    for _ in 0..3 {
+        let mut hit = false;
+        for p in PREFIXES {
+            if let Some(r) = rest.strip_prefix(p) {
+                rest = r.trim_start();
+                hit = true;
+                break;
+            }
+        }
+        if !hit {
+            break;
+        }
+    }
+    if rest.is_empty() {
+        s
+    } else {
+        rest
+    }
+}
+
+fn story_seed(story: &TurnStory) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mix = |h: &mut u64, s: &str| {
+        for b in s.as_bytes() {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    if let Some(g) = &story.goal {
+        mix(&mut h, g);
+    }
+    h ^= (story.tool_events as u64).wrapping_mul(0x9e37);
+    h ^= (story.ended as u64) << 17;
+    h ^= (story.thinking as u64) << 19;
+    if let Some(t) = &story.last_tool {
+        mix(&mut h, t);
+    }
+    h
+}
+
+fn pick(seed: u64, options: &[String]) -> String {
+    if options.is_empty() {
+        return String::new();
+    }
+    options[(seed as usize) % options.len()].clone()
+}
+
+fn join_soft(items: &[String], max: usize) -> String {
+    let shown = items.len().min(max);
     let slice = &items[..shown];
     let mut s = match slice {
         [] => String::new(),
@@ -637,9 +826,85 @@ fn join_and(items: &[String], max: usize) -> String {
         }
     };
     if items.len() > max {
-        s.push_str(&format!(" (+{})", items.len() - max));
+        s.push_str(" and friends");
     }
     s
+}
+
+fn join_soft_code(items: &[String], max: usize) -> String {
+    let wrapped: Vec<String> = items.iter().map(|s| md_code(s)).collect();
+    join_soft(&wrapped, max)
+}
+
+fn join_soft_em(items: &[String], max: usize) -> String {
+    let wrapped: Vec<String> = items.iter().map(|s| md_em(s)).collect();
+    join_soft(&wrapped, max)
+}
+
+fn md_code(s: &str) -> String {
+    let s = s.replace('`', "'");
+    format!("`{s}`")
+}
+
+fn md_bold(s: &str) -> String {
+    let s = s.replace("**", "");
+    format!("**{s}**")
+}
+
+fn md_em(s: &str) -> String {
+    let s = s.replace('*', "");
+    format!("*{s}*")
+}
+
+fn looks_like_build_cmds(ran: &[String]) -> bool {
+    ran.iter().any(|c| {
+        let l = c.to_lowercase();
+        l.contains("check")
+            || l.contains("test")
+            || l.contains("build")
+            || l.contains("lint")
+            || l.contains("clippy")
+            || l.contains("tsc")
+            || l.contains("pytest")
+            || l.contains("npm test")
+            || l.contains("cargo t")
+            || l.contains("cargo b")
+    })
+}
+
+fn truncate_words(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for word in s.split_whitespace() {
+        let candidate = if out.is_empty() {
+            word.to_string()
+        } else {
+            format!("{out} {word}")
+        };
+        if candidate.chars().count() > max_chars.saturating_sub(1) {
+            break;
+        }
+        out = candidate;
+    }
+    if out.is_empty() {
+        truncate(s, max_chars)
+    } else {
+        format!("{out}…")
+    }
+}
+
+fn ensure_sentence(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.ends_with(['.', '!', '?', '…']) {
+        s.to_string()
+    } else {
+        format!("{s}.")
+    }
 }
 
 fn format_tool_activity(part: &Value) -> Option<String> {
@@ -1776,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn digest_jsonl_tail_builds_retrospective_summary() {
+    fn digest_jsonl_tail_builds_story_prose() {
         let dir = std::env::temp_dir().join(format!(
             "manager-summary-test-{}",
             SystemTime::now()
@@ -1786,58 +2051,91 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("chat.jsonl");
-        let body = r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nadd a summary bar\n</user_query>"}]}}
-{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/x/app.rs"}},{"type":"tool_use","name":"StrReplace","input":{"path":"/x/app.rs"}},{"type":"tool_use","name":"Shell","input":{"command":"cargo check"}}]}}
-{"type":"turn_ended","status":"success"}
+        let body = r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nfix the streaming bug\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"I'll dig into the streaming bug."},{"type":"tool_use","name":"Read","input":{"path":"/x/stream.rs"}},{"type":"tool_use","name":"StrReplace","input":{"path":"/x/stream.rs"}},{"type":"tool_use","name":"Shell","input":{"command":"cargo build"}}]}}
 "#;
         fs::write(&path, body).unwrap();
         let digest = digest_jsonl_tail(&path);
         let _ = fs::remove_dir_all(&dir);
         let digest = digest.expect("digest");
-        assert_eq!(digest.live_status.as_deref(), Some("Waiting for input"));
         let summary = digest.summary.expect("summary");
-        assert_eq!(summary.goal.as_deref(), Some("add a summary bar"));
+        assert_eq!(summary.goal.as_deref(), Some("fix the streaming bug"));
+        let prose = summary.prose.to_lowercase();
         assert!(
-            summary
-                .lines
-                .iter()
-                .any(|l| l.kind == SummaryKind::Edited && l.text.contains("app.rs")),
-            "{:?}",
-            summary.lines
+            prose.contains("streaming bug"),
+            "expected topic in narrative: {:?}",
+            summary.prose
         );
         assert!(
-            summary.lines.iter().any(|l| {
-                l.kind == SummaryKind::Ran
-                    && (l.text.contains("cargo check") || l.text.contains("verified with"))
-            }),
-            "{:?}",
-            summary.lines
+            prose.contains("build") || prose.contains("working") || prose.contains("hard"),
+            "expected casual scene, got {:?}",
+            summary.prose
         );
         assert!(
-            summary.lines.iter().any(|l| l.kind == SummaryKind::Read),
-            "{:?}",
-            summary.lines
+            !prose.contains("edited"),
+            "summary should not be a tool history: {:?}",
+            summary.prose
+        );
+        assert!(
+            !prose.contains("i'll dig"),
+            "should not paste agent chatter: {:?}",
+            summary.prose
         );
     }
 
     #[test]
-    fn build_session_summary_structured_lines() {
-        let summary = build_session_summary(
-            Some("add a summary bar"),
-            &["app.rs".into()],
-            &["cargo check".into()],
-            &[],
-            &[],
-            &[],
-            1,
-            None,
-        )
-        .expect("summary");
+    fn compose_story_sounds_like_a_scene() {
+        let story = TurnStory {
+            goal: Some("fix the streaming bug".into()),
+            ended: false,
+            thinking: false,
+            edited: vec!["stream.rs".into()],
+            ran: vec!["cargo build".into()],
+            searched: vec![],
+            tasks: vec![],
+            read_count: 8,
+            tool_events: 12,
+            assistant_chars: 600,
+            last_tool: Some("Running cargo build".into()),
+        };
+        let prose = compose_story(&story).to_lowercase();
+        assert!(prose.contains("streaming bug"), "{prose:?}");
+        assert!(
+            prose.contains("build") || prose.contains("complicated") || prose.contains("hard"),
+            "{prose:?}"
+        );
+        assert!(!prose.contains("currently editing"), "{prose:?}");
+        assert!(!prose.starts_with("working on"), "{prose:?}");
+    }
+
+    #[test]
+    fn compose_story_for_fresh_ask() {
+        let story = TurnStory {
+            goal: Some("add a summary bar".into()),
+            ended: false,
+            thinking: true,
+            edited: vec![],
+            ran: vec![],
+            searched: vec![],
+            tasks: vec![],
+            read_count: 0,
+            tool_events: 0,
+            assistant_chars: 0,
+            last_tool: None,
+        };
+        let summary = build_session_summary(&story).expect("summary");
         assert_eq!(summary.goal.as_deref(), Some("add a summary bar"));
-        assert_eq!(summary.lines[0].kind, SummaryKind::Edited);
-        assert_eq!(summary.lines[0].text, "app.rs");
-        assert_eq!(summary.lines[1].kind, SummaryKind::Ran);
-        assert!(summary.lines[1].text.contains("cargo check"));
-        assert_eq!(summary.lines[2].kind, SummaryKind::Read);
+        let prose = summary.prose.to_lowercase();
+        assert!(prose.contains("summary bar"), "{prose:?}");
+        assert!(
+            prose.contains("thinking") || prose.contains("looking") || prose.contains("oriented"),
+            "{prose:?}"
+        );
+    }
+
+    #[test]
+    fn casual_topic_strips_imperatives() {
+        assert_eq!(casual_topic("fix the streaming bug"), "that streaming bug");
+        assert_eq!(casual_topic("add a summary bar"), "that summary bar");
     }
 }

@@ -39,7 +39,7 @@ nix build .#manager
 
 The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests Tasks under each session (from `agent-transcripts/<chatId>/`, `subagents/`, and Task records in the chat store). Click a session to focus its terminal; click a Task to open its nested chat (`isSubagent`) in a new tab when Cursor created one, or focus the parent if not. Right-click a session for rename. **Close** removes the active session.
 
-**Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager places it back on the clipboard and sends `^V` into the TUI (then types the initial prompt and submits). `--image` is headless-only, so interactive sessions cannot rely on it.
+**Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager types `@/path.png` into the TUI composer (so the agent attaches it synchronously), then types the initial prompt and submits. `--image` is headless-only, so interactive sessions cannot rely on it.
 
 ## Requirements
 

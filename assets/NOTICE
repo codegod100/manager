@@ -5,3 +5,22 @@ https://openfontlicense.org
 
 Used as the embedded egui_term typeface so Unicode punctuation (e.g. →)
 shares the same cell advance as ASCII, avoiding cursor/glyph overlap.
+
+---
+
+term-symbols.ttf combines:
+
+1. Braille Patterns (U+2800–U+28FF) subset of DejaVu Sans
+   (https://dejavu-fonts.github.io/), Copyright Bitstream / DejaVu authors.
+   Licensed under the Bitstream Vera / DejaVu fonts license — see
+   https://dejavu-fonts.github.io/License.html
+   Covers cursor-agent’s ink spinner frames on “Running … tok” rows.
+
+2. ⌕ (U+2315) outline copied from Noto Sans Symbols
+   (https://fonts.google.com/noto/specimen/Noto+Sans+Symbols), Copyright 2022
+   The Noto Project Authors. SIL Open Font License 1.1:
+   https://openfontlicense.org
+   Covers cursor-agent’s “Find …” tool marker.
+
+Rebuild: `scripts/rebuild-term-symbols-ttf.sh`
+(needs `python3` + `fonttools`).
