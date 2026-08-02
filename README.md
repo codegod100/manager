@@ -41,6 +41,19 @@ The left **Agents** sidebar groups sessions by workspace (folder name; hover for
 
 **Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager types `@/path.png` into the TUI composer (so the agent attaches it synchronously), then types the initial prompt and submits. `--image` is headless-only, so interactive sessions cannot rely on it.
 
+## Android APK
+
+Shell package (`uk.nandi.manager`) for phone / Waydroid install smoke tests. Full cursor-agent PTY sessions stay on the desktop build (egui_term needs a Unix PTY).
+
+```bash
+nix develop
+just apk-release          # aarch64 release → android/target/release/apk/manager.apk
+just apk-release-x86      # x86_64 (Waydroid)
+./scripts/build-apk.sh --release --target aarch64-linux-android
+```
+
+Needs Android NDK (`ANDROID_NDK_HOME`, default `~/.local/share/android-ndk-r29`), `cargo-apk`, and `rustup target add aarch64-linux-android` (and/or `x86_64-linux-android`).
+
 ## Requirements
 
 - Rust toolchain

@@ -12,7 +12,7 @@ use egui_term::{
     BackendCommand, Binding, BindingAction, ColorPalette, FontSettings, InputKind, PtyEvent,
     TerminalBackend, TerminalFont, TerminalMode, TerminalTheme, TerminalView,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -214,6 +214,8 @@ pub struct App {
     prompt_image_textures: BTreeMap<PathBuf, TextureHandle>,
     /// Closed-but-not-yet-dropped backends waiting for `PtyEvent::Exit`.
     draining: Vec<DrainingPty>,
+    /// Workspace paths whose session lists are folded in the sidebar.
+    workspace_folded: BTreeSet<PathBuf>,
 }
 
 impl App {
@@ -263,6 +265,7 @@ impl App {
             }),
             prompt_image_textures: BTreeMap::new(),
             draining: Vec::new(),
+            workspace_folded: BTreeSet::new(),
         }
     }
 
@@ -727,6 +730,7 @@ impl App {
         let mut auto_rename: Option<u64> = None;
         let mut open_rename: Option<u64> = None;
         let mut toggle_tasks_fold: Option<u64> = None;
+        let mut toggle_workspace_fold: Option<PathBuf> = None;
         let mut open_task: Option<(PathBuf, String, String)> = None;
 
         egui::SidePanel::left("agents")
@@ -756,14 +760,39 @@ impl App {
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or("workspace");
-                            ui.label(
-                                egui::RichText::new(ws_label)
-                                    .size(theme.type_scale.caption)
-                                    .strong()
-                                    .color(theme.palette.text_secondary),
-                            )
-                            .on_hover_text(workspace.display().to_string());
+                            let ws_folded = self.workspace_folded.contains(workspace);
+                            let chevron = if ws_folded { "▶" } else { "▼" };
+                            let header = format!("{chevron} {ws_label}");
+                            let fold = ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(header)
+                                            .size(theme.type_scale.caption)
+                                            .strong()
+                                            .color(theme.palette.text_secondary),
+                                    )
+                                    .frame(false),
+                                )
+                                .on_hover_text(if ws_folded {
+                                    format!(
+                                        "Expand sessions\n{}",
+                                        workspace.display()
+                                    )
+                                } else {
+                                    format!(
+                                        "Fold sessions\n{}",
+                                        workspace.display()
+                                    )
+                                });
+                            if fold.clicked() {
+                                toggle_workspace_fold = Some(workspace.clone());
+                            }
                             ui.add_space(theme.spacing.xs);
+
+                            if ws_folded {
+                                ui.add_space(theme.spacing.xs);
+                                continue;
+                            }
 
                             for &id in ids {
                                 let Some(session) = self.sessions.get(&id) else {
@@ -1138,6 +1167,11 @@ impl App {
         if let Some(id) = toggle_tasks_fold {
             if let Some(session) = self.sessions.get_mut(&id) {
                 session.tasks_folded = !session.tasks_folded;
+            }
+        }
+        if let Some(workspace) = toggle_workspace_fold {
+            if !self.workspace_folded.remove(&workspace) {
+                self.workspace_folded.insert(workspace);
             }
         }
         if let Some((workspace, chat_id, title)) = open_task {

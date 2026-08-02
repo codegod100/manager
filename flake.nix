@@ -196,6 +196,7 @@
             librsvg
             gtk3
             desktop-file-utils # update-desktop-database
+            just
           ];
 
           # Local cargo build (devshell tools; no pure sandbox / remote upload lock).
@@ -311,7 +312,18 @@
             buildInputs = libs;
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libs;
             shellHook = ''
-              echo "manager — nix run (.desktop+icon) | nix run .#manager | nix run .#build | nix develop"
+              export PATH="$HOME/.cargo/bin:$PATH"
+              export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-$HOME/.local/share/android-ndk-r29}"
+              export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+              export ANDROID_HOME="''${ANDROID_HOME:-$HOME/.local/share/android-sdk}"
+              export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$ANDROID_HOME/platform-tools:$PATH"
+              export CC_aarch64_linux_android="''${CC_aarch64_linux_android:-aarch64-linux-android28-clang}"
+              export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+              export AR_aarch64_linux_android="''${AR_aarch64_linux_android:-llvm-ar}"
+              export CC_x86_64_linux_android="''${CC_x86_64_linux_android:-x86_64-linux-android28-clang}"
+              export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CC_x86_64_linux_android"
+              export AR_x86_64_linux_android="''${AR_x86_64_linux_android:-llvm-ar}"
+              echo "manager — nix run | just apk-release | nix develop"
             '';
           };
         }

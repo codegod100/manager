@@ -1,4 +1,5 @@
 /target
+/android/target
 /result
 /result-*
 .desktop-share
