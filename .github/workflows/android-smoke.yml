@@ -24,7 +24,7 @@ jobs:
         options: >-
           --privileged
           --device /dev/kvm
-          -e EMULATOR_DEVICE=Samsung Galaxy S10
+          -e "EMULATOR_DEVICE=Samsung Galaxy S10"
           -e WEB_VNC=false
           -e APPIUM=false
           -e AUTO_RECORD=false
