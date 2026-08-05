@@ -59,9 +59,3 @@ label = "Agent Manager"
 orientations = ["Portrait", "Landscape"]
 theme = "@android:style/Theme.DeviceDefault.NoActionBar"
 icon = "@mipmap/ic_launcher"
-
-[package.metadata.android.signing.release]
-path = "/home/nandi/.android/manager-release.keystore"
-keystore_password = "android"
-key_alias = "manager"
-key_password = "android"
