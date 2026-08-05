@@ -1,8 +1,10 @@
 //! Desktop multi-agent manager for cursor-agent.
 
 mod app;
+mod auth;
 mod clipboard;
 mod convert;
+mod oidc;
 mod session;
 mod subagents;
 
