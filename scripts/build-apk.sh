@@ -9,6 +9,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/android"
 TARGET="${MANAGER_ANDROID_TARGET:-aarch64-linux-android}"
 RELEASE=0
+CARGO_RESTORE=0
 
 usage() {
   cat >&2 <<'EOF'
@@ -18,11 +19,24 @@ Usage: build-apk.sh [--release] [--target <triple>]
   --target    default aarch64-linux-android (phones); x86_64-linux-android for Waydroid
 
 Env:
-  ANDROID_NDK_HOME  default ~/.local/share/android-ndk-r29
-  ANDROID_HOME      default ~/.local/share/android-sdk
+  ANDROID_NDK_HOME           default ~/.local/share/android-ndk-r29
+  ANDROID_HOME                 default ~/.local/share/android-sdk
+  ANDROID_KEYSTORE_PATH        release keystore path (default ~/.android/manager-release.keystore)
+  ANDROID_KEYSTORE_BASE64      base64-encoded keystore (CI)
+  ANDROID_KEYSTORE_PASSWORD    keystore password (default android)
+  ANDROID_KEY_ALIAS            key alias (default manager)
+  ANDROID_KEY_PASSWORD         key password (default ANDROID_KEYSTORE_PASSWORD)
 EOF
   exit 2
 }
+
+restore_cargo_toml() {
+  if [[ "$CARGO_RESTORE" -eq 1 && -f "$APP/Cargo.toml.buildbak" ]]; then
+    mv -f "$APP/Cargo.toml.buildbak" "$APP/Cargo.toml"
+    CARGO_RESTORE=0
+  fi
+}
+trap restore_cargo_toml EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,32 +95,45 @@ if ! rustc --print sysroot --target "$TARGET" >/dev/null 2>&1; then
 fi
 
 ensure_release_signing() {
-  local keystore="$HOME/.android/manager-release.keystore"
-  local props="$HOME/.android/manager-release.properties"
-  if [[ ! -f "$keystore" ]]; then
+  local keystore="${ANDROID_KEYSTORE_PATH:-$HOME/.android/manager-release.keystore}"
+  local storepass="${ANDROID_KEYSTORE_PASSWORD:-android}"
+  local alias="${ANDROID_KEY_ALIAS:-manager}"
+  local keypass="${ANDROID_KEY_PASSWORD:-$storepass}"
+
+  if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+    echo "decoding release keystore from ANDROID_KEYSTORE_BASE64" >&2
+    mkdir -p "$(dirname "$keystore")"
+    echo "$ANDROID_KEYSTORE_BASE64" | base64 -d >"$keystore"
+  elif [[ ! -f "$keystore" ]]; then
     echo "generating release keystore at $keystore" >&2
-    mkdir -p "$HOME/.android"
+    need keytool
+    mkdir -p "$(dirname "$keystore")"
     keytool -genkeypair -v \
       -keystore "$keystore" \
-      -alias manager \
+      -alias "$alias" \
       -keyalg RSA -keysize 2048 -validity 10000 \
-      -storepass android -keypass android \
+      -storepass "$storepass" -keypass "$keypass" \
       -dname "CN=Agent Manager, OU=nandi.uk, O=nandi, L=Unknown, ST=Unknown, C=US" \
       >/dev/null
   fi
-  if ! grep -q 'signing.release' "$APP/Cargo.toml"; then
-    cat >>"$APP/Cargo.toml" <<EOF
+
+  cp "$APP/Cargo.toml" "$APP/Cargo.toml.buildbak"
+  CARGO_RESTORE=1
+  # Strip any existing signing.release block, then inject the current keystore.
+  awk '
+    /^\[package\.metadata\.android\.signing\.release\]/ { skip=1; next }
+    skip && /^\[/ { skip=0 }
+    !skip { print }
+  ' "$APP/Cargo.toml" >"$APP/Cargo.toml.tmp"
+  cat >>"$APP/Cargo.toml.tmp" <<EOF
 
 [package.metadata.android.signing.release]
 path = "$keystore"
-keystore_password = "android"
-key_alias = "manager"
-key_password = "android"
+keystore_password = "$storepass"
+key_alias = "$alias"
+key_password = "$keypass"
 EOF
-    echo "note: appended signing.release to android/Cargo.toml (local only)" >&2
-  fi
-  # Keep a properties note for humans (not read by cargo-apk).
-  printf 'keystore=%s\nalias=manager\n' "$keystore" >"$props"
+  mv "$APP/Cargo.toml.tmp" "$APP/Cargo.toml"
 }
 
 profile=debug
