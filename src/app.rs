@@ -1,5 +1,10 @@
 //! Main window: vidya chrome, session sidebar, embedded agent terminals.
 
+use crate::auth::{
+    complete_oidc_login, cursor_auth_status_label, fetch_cursor_api_key, has_cursor_api_key,
+    load_bao_token, resolve_bao_addr, restore_cursor_auth,
+};
+use crate::oidc::{start_oidc_login, OidcLogin, OidcLoginConfig, OidcLoginEvent};
 use crate::session::{
     kill_pid, list_saved_chats, title_case_words, AgentSession, NewSessionDraft, PreparedSession,
     SavedChat,
@@ -73,6 +78,25 @@ struct ConvertDialog {
     converting: bool,
     /// Request focus on the bash field once when opened.
     focus: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMethod {
+    Token,
+    Oidc,
+}
+
+/// OpenBao OIDC / token sign-in for `CURSOR_API_KEY`.
+struct AuthDialog {
+    address: String,
+    bao_token: String,
+    show_token_field: bool,
+    auth_method: AuthMethod,
+    oidc_mount: String,
+    oidc_role: String,
+    oidc_login: Option<OidcLogin>,
+    oidc_auth_url: String,
+    status: String,
 }
 
 impl Default for ConvertDialog {
@@ -216,6 +240,10 @@ pub struct App {
     draining: Vec<DrainingPty>,
     /// Workspace paths whose session lists are folded in the sidebar.
     workspace_folded: BTreeSet<PathBuf>,
+    auth_dialog: Option<AuthDialog>,
+    /// One-shot restore from `~/.bao-token` on first frame.
+    pending_auto_auth: bool,
+    cursor_auth_label: String,
 }
 
 impl App {
@@ -266,6 +294,9 @@ impl App {
             prompt_image_textures: BTreeMap::new(),
             draining: Vec::new(),
             workspace_folded: BTreeSet::new(),
+            auth_dialog: None,
+            pending_auto_auth: true,
+            cursor_auth_label: cursor_auth_status_label(),
         }
     }
 
@@ -274,6 +305,156 @@ impl App {
             || self.resume_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.convert_dialog.is_some()
+            || self.auth_dialog.is_some()
+    }
+
+    fn open_auth_dialog(&mut self) {
+        let oidc_defaults = OidcLoginConfig::from_env_defaults();
+        let stored = load_bao_token();
+        self.auth_dialog = Some(AuthDialog {
+            address: resolve_bao_addr(),
+            bao_token: stored.clone(),
+            show_token_field: stored.is_empty(),
+            auth_method: AuthMethod::Oidc,
+            oidc_mount: oidc_defaults.mount,
+            oidc_role: oidc_defaults.role,
+            oidc_login: None,
+            oidc_auth_url: String::new(),
+            status: if has_cursor_api_key() {
+                "CURSOR_API_KEY is already set in the environment.".into()
+            } else {
+                String::new()
+            },
+        });
+    }
+
+    fn cancel_oidc_login(dialog: &mut AuthDialog) {
+        if let Some(login) = dialog.oidc_login.take() {
+            login.cancel();
+        }
+        dialog.oidc_auth_url.clear();
+    }
+
+    fn start_oidc_login(&mut self) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        let address = dialog.address.clone();
+        let mount = dialog.oidc_mount.clone();
+        let role = dialog.oidc_role.clone();
+        Self::cancel_oidc_login(dialog);
+        let mut cfg = OidcLoginConfig::from_env_defaults();
+        cfg.address = address;
+        cfg.mount = mount;
+        cfg.role = role;
+        match start_oidc_login(cfg) {
+            Ok(login) => {
+                dialog.oidc_login = Some(login);
+                dialog.status = "Waiting for OIDC login in browser…".into();
+            }
+            Err(e) => dialog.status = e,
+        }
+    }
+
+    fn finish_bao_token_auth(&mut self, bao_token: String) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        let address = dialog.address.clone();
+        dialog.bao_token = bao_token.clone();
+        dialog.status = "Fetching Cursor API key…".into();
+        match complete_oidc_login(&address, &bao_token) {
+            Ok(()) => {
+                self.cursor_auth_label = cursor_auth_status_label();
+                dialog.status = "Cursor API key loaded.".into();
+                dialog.show_token_field = false;
+                dialog.oidc_login = None;
+                dialog.oidc_auth_url.clear();
+            }
+            Err(e) => {
+                dialog.status = e.to_string();
+                dialog.show_token_field = true;
+            }
+        }
+    }
+
+    fn try_token_auth(&mut self) {
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        let address = dialog.address.trim().to_string();
+        let token = dialog.bao_token.trim().to_string();
+        if address.is_empty() {
+            dialog.status = "Server address is required.".into();
+            return;
+        }
+        if token.is_empty() {
+            dialog.status = "OpenBao token is required.".into();
+            dialog.show_token_field = true;
+            return;
+        }
+        dialog.status = "Fetching Cursor API key…".into();
+        match fetch_cursor_api_key(&address, &token) {
+            Ok(cursor_key) => {
+                crate::auth::apply_cursor_api_key(&cursor_key);
+                if let Err(e) = crate::auth::save_bao_token(&token) {
+                    dialog.status = format!("Key loaded but token save failed: {e}");
+                } else {
+                    dialog.status = "Cursor API key loaded.".into();
+                }
+                self.cursor_auth_label = cursor_auth_status_label();
+                dialog.show_token_field = false;
+            }
+            Err(e) => {
+                dialog.status = e.to_string();
+                dialog.show_token_field = true;
+            }
+        }
+    }
+
+    fn poll_oidc_login(&mut self, ctx: &egui::Context) {
+        let event = self
+            .auth_dialog
+            .as_ref()
+            .and_then(|d| d.oidc_login.as_ref())
+            .and_then(|login| login.try_recv());
+        let Some(event) = event else {
+            return;
+        };
+        let Some(dialog) = self.auth_dialog.as_mut() else {
+            return;
+        };
+        match event {
+            OidcLoginEvent::Ready {
+                auth_url,
+                browser_error,
+            } => {
+                dialog.oidc_auth_url = auth_url;
+                dialog.status = if let Some(err) = browser_error {
+                    format!("Open this URL manually:\n{err}")
+                } else {
+                    "Complete login in your browser, then return here…".into()
+                };
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            OidcLoginEvent::Success { token } => {
+                dialog.oidc_login = None;
+                dialog.oidc_auth_url.clear();
+                self.finish_bao_token_auth(token);
+            }
+            OidcLoginEvent::Failed(msg) => {
+                dialog.oidc_login = None;
+                dialog.oidc_auth_url.clear();
+                dialog.status = msg;
+            }
+        }
+    }
+
+    fn try_restore_cursor_auth(&mut self) {
+        match restore_cursor_auth() {
+            Ok(()) => self.cursor_auth_label = cursor_auth_status_label(),
+            Err(_) => self.cursor_auth_label = cursor_auth_status_label(),
+        }
     }
 
     fn poll_pty_events(&mut self, ctx: &egui::Context) {
@@ -645,6 +826,7 @@ impl App {
         let mut open_new = false;
         let mut open_resume = false;
         let mut open_convert = false;
+        let mut open_auth = false;
         let busy = self.pending_spawn.is_some();
 
         vidya::top_header(ctx, &theme, |ui| {
@@ -669,11 +851,24 @@ impl App {
                         }
                     });
                     ui.add_space(theme.spacing.sm);
+                    let auth_label = if has_cursor_api_key() {
+                        self.cursor_auth_label.clone()
+                    } else {
+                        "Cursor: sign in".to_string()
+                    };
+                    if vidya::button(ui, &theme, &auth_label).clicked() {
+                        open_auth = true;
+                    }
+                    ui.add_space(theme.spacing.sm);
                     let utils_text = egui::RichText::new("Utils")
                         .size(theme.type_scale.body)
                         .color(theme.palette.button_fg);
                     ui.menu_button(utils_text, |ui| {
                         ui.set_min_width(180.0);
+                        if ui.button("Cursor sign-in (OIDC)…").clicked() {
+                            open_auth = true;
+                            ui.close_menu();
+                        }
                         if ui.button("Convert to nushell").clicked() {
                             open_convert = true;
                             ui.close_menu();
@@ -711,6 +906,9 @@ impl App {
             self.resume_dialog = None;
             self.resume_load_rx = None;
             self.spawn_error = None;
+        }
+        if open_auth {
+            self.open_auth_dialog();
         }
     }
 
@@ -2034,11 +2232,156 @@ impl App {
             .insert(path.to_path_buf(), tex.clone());
         Some(tex)
     }
+
+    fn show_auth_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.auth_dialog.take() else {
+            return;
+        };
+
+        let theme = self.theme.clone();
+        let mut close = false;
+        let mut start_oidc = false;
+        let mut use_token = false;
+        let oidc_busy = dialog.oidc_login.is_some();
+
+        vidya::dialog("Cursor sign-in", &theme)
+            .default_size([440.0, 420.0])
+            .min_width(360.0)
+            .show(ctx, |ui| {
+                vidya::title_2(ui, &theme, "OpenBao → Cursor API key");
+                ui.add_space(theme.spacing.sm);
+                vidya::dim_label(
+                    ui,
+                    &theme,
+                    "OIDC login to OpenBao, then read CURSOR_API_KEY from secret/data/ai-api-keys.",
+                );
+                ui.add_space(theme.spacing.md);
+                vidya::dim_label(ui, &theme, "OpenBao address");
+                vidya::text_field_singleline(ui, &theme, &mut dialog.address);
+                ui.add_space(theme.spacing.sm);
+                vidya::dim_label(ui, &theme, "Auth method");
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(dialog.auth_method == AuthMethod::Token, "Token")
+                        .clicked()
+                    {
+                        Self::cancel_oidc_login(&mut dialog);
+                        dialog.auth_method = AuthMethod::Token;
+                    }
+                    if ui
+                        .selectable_label(dialog.auth_method == AuthMethod::Oidc, "OIDC")
+                        .clicked()
+                    {
+                        dialog.auth_method = AuthMethod::Oidc;
+                    }
+                });
+
+                match dialog.auth_method {
+                    AuthMethod::Token => {
+                        if dialog.show_token_field {
+                            ui.add_space(theme.spacing.sm);
+                            vidya::dim_label(ui, &theme, "OpenBao token");
+                            let tw = ui.available_width().max(1.0);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dialog.bao_token)
+                                    .password(true)
+                                    .desired_width(tw),
+                            );
+                        } else if !dialog.bao_token.is_empty() {
+                            ui.add_space(theme.spacing.sm);
+                            vidya::dim_label(ui, &theme, "Using stored OpenBao token");
+                            if vidya::button(ui, &theme, "Use a different token").clicked() {
+                                dialog.show_token_field = true;
+                                dialog.bao_token.clear();
+                            }
+                        }
+                    }
+                    AuthMethod::Oidc => {
+                        ui.add_space(theme.spacing.sm);
+                        vidya::dim_label(ui, &theme, "OIDC mount");
+                        vidya::text_field_singleline(ui, &theme, &mut dialog.oidc_mount);
+                        ui.add_space(theme.spacing.sm);
+                        vidya::dim_label(ui, &theme, "Role (optional)");
+                        vidya::text_field_singleline(ui, &theme, &mut dialog.oidc_role);
+                        if !dialog.oidc_auth_url.is_empty() {
+                            ui.add_space(theme.spacing.sm);
+                            vidya::dim_label(ui, &theme, "Authorization URL");
+                            let tw = ui.available_width().max(1.0);
+                            ui.add(
+                                egui::TextEdit::multiline(&mut dialog.oidc_auth_url)
+                                    .desired_width(tw)
+                                    .desired_rows(3),
+                            );
+                        }
+                    }
+                }
+
+                if !dialog.status.is_empty() {
+                    ui.add_space(theme.spacing.sm);
+                    ui.label(&dialog.status);
+                }
+
+                ui.add_space(theme.spacing.md);
+                ui.horizontal(|ui| {
+                    match dialog.auth_method {
+                        AuthMethod::Oidc => {
+                            ui.add_enabled_ui(!oidc_busy, |ui| {
+                                let label = if oidc_busy {
+                                    "Waiting for browser…"
+                                } else {
+                                    "Sign in with OIDC"
+                                };
+                                if vidya::primary_button(ui, &theme, label).clicked() {
+                                    start_oidc = true;
+                                }
+                            });
+                        }
+                        AuthMethod::Token => {
+                            if vidya::primary_button(ui, &theme, "Load Cursor key").clicked() {
+                                use_token = true;
+                            }
+                        }
+                    }
+                    if vidya::button(ui, &theme, "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if start_oidc {
+            self.auth_dialog = Some(dialog);
+            self.start_oidc_login();
+            return;
+        }
+        if use_token {
+            self.auth_dialog = Some(dialog);
+            self.try_token_auth();
+            return;
+        }
+        if close {
+            Self::cancel_oidc_login(&mut dialog);
+        } else {
+            self.auth_dialog = Some(dialog);
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         vidya::apply(ctx, &self.theme);
+
+        if self.pending_auto_auth {
+            self.pending_auto_auth = false;
+            self.try_restore_cursor_auth();
+        }
+
+        if self
+            .auth_dialog
+            .as_ref()
+            .is_some_and(|d| d.oidc_login.is_some())
+        {
+            self.poll_oidc_login(ctx);
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown_all_sessions();
@@ -2060,6 +2403,7 @@ impl eframe::App for App {
         self.show_resume_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_convert_dialog(ctx);
+        self.show_auth_dialog(ctx);
     }
 }
 
