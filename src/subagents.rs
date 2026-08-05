@@ -1947,6 +1947,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Cursor chat fixtures under ~/.cursor"]
     fn poll_known_task_chat_finds_description() {
         let chat = "0c42e075-6bbb-4f4c-9a60-e507bdd3b011";
         let snap = poll_chat(chat, Some(Path::new("/home/nandi/code/sleek")));
@@ -1960,6 +1961,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Cursor chat fixtures under ~/.cursor"]
     fn linked_subagent_chat_is_resumable() {
         // Parent launched Task "Find search click bugs"; Cursor created an
         // isSubagent chat referenced as `$ad7163aa-…` in the parent store.
@@ -1989,6 +1991,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local Cursor chat fixtures under ~/.cursor"]
     fn image_paste_chat_has_no_js_noise_tasks() {
         // This chat's store.db embeds Cursor UI source mentioning taskToolCall
         // dozens of times — none are real Task invocations.

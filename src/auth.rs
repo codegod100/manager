@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn cursor_key_field_priority() {
-        let mut keys = BTreeMap::new();
+        let mut keys: BTreeMap<String, String> = BTreeMap::new();
         keys.insert("cursor_api_key".into(), "lower".into());
         keys.insert("CURSOR_API_KEY".into(), "upper".into());
         let picked = CURSOR_KEY_FIELDS
