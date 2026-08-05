@@ -2,6 +2,7 @@
 
 mod app;
 mod clipboard;
+mod cloud;
 mod convert;
 mod session;
 mod subagents;
