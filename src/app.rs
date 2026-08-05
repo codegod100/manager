@@ -938,7 +938,7 @@ impl App {
             .frame(
                 egui::Frame::NONE
                     .fill(theme.palette.view_bg)
-                    .stroke(egui::Stroke::new(1.0, theme.palette.border_soft))
+                    .stroke(egui::Stroke::new(1.0_f32, theme.palette.border_soft))
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
             .show_separator_line(false)
@@ -1824,7 +1824,7 @@ impl App {
                                 theme.palette.popover_bg
                             };
                             let stroke = egui::Stroke::new(
-                                1.0,
+                                1.0_f32,
                                 if is_sel {
                                     theme.palette.accent
                                 } else {

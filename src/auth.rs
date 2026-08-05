@@ -30,6 +30,12 @@ impl From<String> for AuthError {
     }
 }
 
+impl From<&str> for AuthError {
+    fn from(s: &str) -> Self {
+        AuthError::Message(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Health {
     pub initialized: bool,

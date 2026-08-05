@@ -1557,6 +1557,7 @@ dependencies = [
  "egui_term",
  "image",
  "reqwest",
+ "serde",
  "serde_json",
  "url",
  "vidya",
