@@ -5,12 +5,41 @@
 //! desktop app. This APK ships the branded UI for phone / Waydroid / emulator
 //! smoke tests.
 
-use eframe::egui::{self, Align, Layout, RichText, ScrollArea};
+use eframe::egui::{self, Align, Label, Layout, RichText, ScrollArea, Sense, Ui};
 use vidya::{
-    apply_dark, body, card, dim_label, primary_button, reserve_system_chrome, title, title_2, Theme,
+    apply_dark, card, dim_label, primary_button, reserve_system_chrome, title, Theme,
 };
 
 const APP_TITLE: &str = "Agent Manager";
+
+/// egui skips drag-to-select when a touchscreen is present (scroll wins). This APK
+/// runs under Waydroid / phones, so force click-and-drag selection for copyable text.
+fn selectable_title_2(ui: &mut Ui, theme: &Theme, text: &str) {
+    ui.add(
+        Label::new(
+            RichText::new(text)
+                .size(theme.type_scale.title_2)
+                .strong()
+                .color(theme.palette.text),
+        )
+        .wrap()
+        .selectable(true)
+        .sense(Sense::click_and_drag()),
+    );
+}
+
+fn selectable_body(ui: &mut Ui, theme: &Theme, text: &str) {
+    ui.add(
+        Label::new(
+            RichText::new(text)
+                .size(theme.type_scale.body)
+                .color(theme.palette.text),
+        )
+        .wrap()
+        .selectable(true)
+        .sense(Sense::click_and_drag()),
+    );
+}
 
 /// Desktop smoke-test entry (`cargo run --manifest-path android/Cargo.toml` is
 /// not wired; use the root crate). Kept so the lib type-checks off-Android.
@@ -79,6 +108,8 @@ impl eframe::App for ManagerShell {
 
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    // Prefer label drag-select over touch pan on this short page.
+                    .drag_to_scroll(false)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.add_space(self.theme.spacing.md);
@@ -88,9 +119,9 @@ impl eframe::App for ManagerShell {
                                 );
 
                                 card(ui, &self.theme, |ui| {
-                                    title_2(ui, &self.theme, "Desktop sessions");
+                                    selectable_title_2(ui, &self.theme, "Desktop sessions");
                                     ui.add_space(self.theme.spacing.sm);
-                                    body(
+                                    selectable_body(
                                         ui,
                                         &self.theme,
                                         "Interactive cursor-agent PTYs (egui_term) need a \
@@ -98,7 +129,7 @@ impl eframe::App for ManagerShell {
                                          already wraps cursor-agent into PATH for desktop runs.",
                                     );
                                     ui.add_space(self.theme.spacing.md);
-                                    body(
+                                    selectable_body(
                                         ui,
                                         &self.theme,
                                         "On your machine:\n\
@@ -110,9 +141,9 @@ impl eframe::App for ManagerShell {
                                 ui.add_space(self.theme.spacing.md);
 
                                 card(ui, &self.theme, |ui| {
-                                    title_2(ui, &self.theme, "This build");
+                                    selectable_title_2(ui, &self.theme, "This build");
                                     ui.add_space(self.theme.spacing.sm);
-                                    body(
+                                    selectable_body(
                                         ui,
                                         &self.theme,
                                         "Package uk.nandi.manager — NativeActivity shell \
@@ -125,10 +156,14 @@ impl eframe::App for ManagerShell {
                                 });
 
                                 ui.add_space(self.theme.spacing.xl);
-                                ui.label(
-                                    RichText::new("nandi.uk/manager")
-                                        .size(self.theme.type_scale.caption)
-                                        .color(self.theme.palette.text_secondary),
+                                ui.add(
+                                    Label::new(
+                                        RichText::new("nandi.uk/manager")
+                                            .size(self.theme.type_scale.caption)
+                                            .color(self.theme.palette.text_secondary),
+                                    )
+                                    .selectable(true)
+                                    .sense(Sense::click_and_drag()),
                                 );
                                 ui.add_space(self.theme.spacing.lg);
                             });
