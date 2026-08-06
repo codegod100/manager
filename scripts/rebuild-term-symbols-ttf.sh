@@ -3,7 +3,7 @@
 #
 # Sources:
 #   - DejaVu Sans → full Braille Patterns block (U+2800–U+28FF) for
-#     cursor-agent’s ink spinner frames (“Running … tok”)
+#     agent ink spinner frames (“Running … tok”)
 #   - Noto Sans Symbols → ⌕ (U+2315) for “Find …” tool rows
 #
 # unitsPerEm differ, so ⌕ is outline-copied + scaled into the DejaVu subset

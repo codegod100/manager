@@ -1,5 +1,12 @@
 {
-  description = "Agent Manager — multi-instance cursor-agent GUI (vidya + egui_term)";
+  description = "Agent Manager — multi-instance prime-agent GUI (vidya + egui_term)";
+
+  nixConfig = {
+    extra-substituters = [ "https://codegod100.cachix.org" ];
+    extra-trusted-public-keys = [
+      "codegod100.cachix.org-1:LZFL5VrR644WUjleS3bLbVeOdzlXqzKznQWvD5MVthA="
+    ];
+  };
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -7,8 +14,8 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # cursor-agent CLI (unfree binary). Used on PATH for desktop sessions.
-    nix-ai-tools.url = "github:numtide/nix-ai-tools";
+    # prime-agent CLI (from codegod100/agentic). Used on PATH for desktop sessions.
+    agentic.url = "github:codegod100/agentic";
     # Fetched for pure `nix build` / `nix profile add` (git+file cannot see
     # siblings). Local cargo apps still use Cargo.toml path = "../vidya".
     # Override while hacking: --override-input vidya path:../vidya
@@ -23,7 +30,7 @@
       self,
       nixpkgs,
       rust-overlay,
-      nix-ai-tools,
+      agentic,
       vidya,
     }:
     let
@@ -119,10 +126,10 @@
           pkgs = pkgsFor system;
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
-          cursor-agent = nix-ai-tools.packages.${system}.cursor-agent;
-          # Clipboard helpers cursor-agent / manager use for image paste.
+          prime-agent = agentic.packages.${system}.prime-agent;
+          # Clipboard helpers + packaged prime-agent for image paste / PTY sessions.
           agentPathBins = [
-            cursor-agent
+            prime-agent
             pkgs.wl-clipboard
             pkgs.xclip
           ];
@@ -181,7 +188,7 @@
             '';
 
             meta = {
-              description = "Multi-instance cursor-agent manager (vidya + egui_term)";
+              description = "Multi-instance prime-agent manager (vidya + egui_term)";
               homepage = "https://tangled.org/nandi.uk/manager";
               license = lib.licenses.mit;
               mainProgram = "manager";
@@ -221,7 +228,7 @@
           default = manager;
           manager = manager;
           desktop = desktop;
-          cursor-agent = cursor-agent;
+          prime-agent = prime-agent;
           # Expose the hermetic SDK so scripts can `nix build .#android-sdk`.
           android-sdk = androidSdk;
         }
@@ -234,9 +241,9 @@
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
           libPath = lib.makeLibraryPath libs;
-          cursor-agent = nix-ai-tools.packages.${system}.cursor-agent;
+          prime-agent = agentic.packages.${system}.prime-agent;
           agentPathBins = [
-            cursor-agent
+            prime-agent
             pkgs.wl-clipboard
             pkgs.xclip
           ];
@@ -429,9 +436,9 @@
             type = "app";
             program = "${apkApp}/bin/manager-apk";
           };
-          cursor-agent = {
+          prime-agent = {
             type = "app";
-            program = "${cursor-agent}/bin/cursor-agent";
+            program = "${prime-agent}/bin/prime-agent";
           };
         }
       );
@@ -442,7 +449,7 @@
           pkgs = pkgsFor system;
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
-          cursor-agent = nix-ai-tools.packages.${system}.cursor-agent;
+          prime-agent = agentic.packages.${system}.prime-agent;
 
           androidComposition = pkgs.androidenv.composeAndroidPackages {
             platformVersions = [ "34" ];
@@ -475,7 +482,7 @@
               pkgs.cargo-apk
               pkgs.jdk17_headless
               pkgs.android-tools
-              cursor-agent
+              prime-agent
               pkgs.wl-clipboard
               pkgs.xclip
             ];
@@ -487,7 +494,7 @@
             ANDROID_NDK_HOME = "${androidSdkRoot}/ndk-bundle";
             ANDROID_NDK_ROOT = "${androidSdkRoot}/ndk-bundle";
             shellHook = ''
-              export PATH="${cursor-agent}/bin:$PATH"
+              export PATH="${prime-agent}/bin:$PATH"
               # Prefer versioned NDK if ndk-bundle is missing.
               if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
                 ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
@@ -508,7 +515,7 @@
               export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CC_x86_64_linux_android"
               export AR_x86_64_linux_android="''${AR_x86_64_linux_android:-llvm-ar}"
               echo "manager — nix run | just apk-release | nix run .#apk -- --release"
-              echo "  cursor-agent: $(command -v cursor-agent)"
+              echo "  prime-agent: $(command -v prime-agent)"
               echo "  ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
             '';
           };

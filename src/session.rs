@@ -1,4 +1,4 @@
-//! Resolve and spawn cursor-agent sessions into PTYs via egui_term.
+//! Resolve and spawn prime-agent sessions into PTYs via egui_term.
 
 use crate::subagents::{self, ChatSnapshot, SessionSummary, Subagent};
 use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
@@ -16,18 +16,19 @@ const ACTIVITY_HOLD: Duration = Duration::from_millis(2500);
 /// Agent binary path resolved once (avoids `which` on the UI thread).
 static AGENT_BIN: OnceLock<Result<String, String>> = OnceLock::new();
 
-/// Everything needed to open a PTY after off-thread `create-chat` / validation.
+/// Everything needed to open a PTY after off-thread validation.
 #[derive(Debug, Clone)]
 pub struct PreparedSession {
     pub shell: String,
     pub args: Vec<String>,
     pub workspace: PathBuf,
+    /// Bound session id when resuming; empty for brand-new sessions until discovery.
     pub chat_id: String,
     pub title: String,
     /// Images + prompt to inject into the interactive composer after the TUI is up.
     ///
-    /// `--image` only works for headless prompts, so interactive sessions paste via
-    /// clipboard + `^V` instead (see [`AgentSession::progress_composer_seed`]).
+    /// Interactive sessions paste via clipboard + `^V` (see
+    /// [`AgentSession::progress_composer_seed`]); `@path` file args also work.
     pub composer_seed: Option<ComposerSeed>,
 }
 
@@ -60,8 +61,6 @@ pub struct NewSessionDraft {
     pub prompt: String,
     /// Clipboard images pasted into the initial prompt (injected into the TUI via `^V`).
     pub images: Vec<PathBuf>,
-    pub trust: bool,
-    pub force: bool,
     /// When set, spawn with `--resume <id>` (initial prompt is ignored).
     pub resume_chat_id: Option<String>,
     /// Tab title override (e.g. saved chat title when resuming).
@@ -78,15 +77,13 @@ impl Default for NewSessionDraft {
             model: String::new(),
             prompt: String::new(),
             images: Vec::new(),
-            trust: true,
-            force: false,
             resume_chat_id: None,
             tab_title: None,
         }
     }
 }
 
-/// A past cursor-agent chat from `~/.cursor/chats`.
+/// A past prime-agent session from `~/.prime/agent/sessions`.
 #[derive(Debug, Clone)]
 pub struct SavedChat {
     pub id: String,
@@ -115,14 +112,16 @@ pub struct AgentSession {
     pub workspace: PathBuf,
     pub backend: TerminalBackend,
     pub alive: bool,
-    /// Direct child PID of the PTY shell (`cursor-agent`), if known.
+    /// Direct child PID of the PTY shell (`prime-agent`), if known.
     ///
     /// Used to kill the agent *before* dropping [`TerminalBackend`]: egui_term's
     /// subscriber only exits on `Event::Exit` (sent when the child exits). Dropping
     /// first sends `Shutdown` and busy-spins the subscriber thread forever.
     pub child_pid: Option<u32>,
-    /// Cursor chat id (`create-chat` or resume); used for title + subagent polling.
+    /// Prime session id (resume or discovered after spawn); used for title + child polling.
     pub chat_id: String,
+    /// Wall time when this local session was prepared (for binding a new session file).
+    pub started_at: SystemTime,
     /// Nested Task/subagents discovered under this chat.
     pub subagents: Vec<Subagent>,
     /// Live status for spinner / needs-input (e.g. "Thinking…").
@@ -147,8 +146,7 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Validate draft + `create-chat` if needed. Safe to run off the UI thread
-    /// (`create-chat` can take multiple seconds).
+    /// Validate draft and build spawn args. Safe to run off the UI thread.
     pub fn prepare(draft: &NewSessionDraft) -> Result<PreparedSession, String> {
         let workspace = PathBuf::from(draft.workspace.trim());
         if draft.workspace.trim().is_empty() {
@@ -162,20 +160,17 @@ impl AgentSession {
         }
 
         let shell = resolve_agent_binary()?;
-        let chat_id = match draft
+        let chat_id = draft
             .resume_chat_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            Some(id) => id.to_string(),
-            None => subagents::create_chat(&shell, &workspace)?,
-        };
-        let mut draft = draft.clone();
-        draft.resume_chat_id = Some(chat_id.clone());
+            .unwrap_or("")
+            .to_string();
 
-        // Interactive TUI ignores `--image` (headless-only). When images were pasted in
-        // the new-session dialog, withhold the CLI prompt too and inject both via PTY.
+        let mut draft = draft.clone();
+        // Interactive sessions paste images via clipboard + `^V`. When images were
+        // pasted in the new-session dialog, withhold the CLI prompt too and inject both.
         let title_from_prompt = sanitize_auto_title(draft.prompt.trim());
         let composer_seed = if draft.images.is_empty() {
             None
@@ -244,6 +239,7 @@ impl AgentSession {
             alive: true,
             child_pid,
             chat_id: prepared.chat_id,
+            started_at: SystemTime::now(),
             subagents: Vec::new(),
             activity: Some("Starting…".into()),
             summary: None,
@@ -266,6 +262,20 @@ impl AgentSession {
             term_select_dragging: false,
             term_select_armed: false,
         })
+    }
+
+    /// Bind `chat_id` from the newest matching session file when still unknown.
+    pub fn try_bind_session_id(&mut self) -> bool {
+        if !self.chat_id.trim().is_empty() {
+            return false;
+        }
+        match subagents::discover_newest_session(&self.workspace, self.started_at) {
+            Some(id) => {
+                self.chat_id = id;
+                true
+            }
+            None => false,
+        }
     }
 
     /// True while a deferred new-session image/prompt inject is still running.
@@ -597,7 +607,7 @@ impl Session {
 
 /// Prefer poller state (meta title, then summary); fall back to terminal text.
 ///
-/// Does not scan `~/.cursor/chats` on the UI thread — that data arrives via
+/// Does not scan `~/.prime/agent/sessions` on the UI thread — that data arrives via
 /// [`AgentSession::apply_chat_snapshot`].
 fn suggest_title_from_content(session: &mut AgentSession) -> Option<String> {
     if let Some(title) = session
@@ -724,11 +734,7 @@ pub fn title_case_words(s: &str) -> String {
         .join(" ")
 }
 
-/// `CURSOR_AGENT` env (path override), else `cursor-agent` on PATH.
-///
-/// Cursor itself sets `CURSOR_AGENT=1` inside agent sessions as a boolean flag —
-/// that must not be treated as a binary path. Does not fall through to bare
-/// `agent` — that name is often another CLI (e.g. grok).
+/// `PRIME_AGENT` env (path override), else `prime-agent` on PATH.
 ///
 /// Result is cached — safe to call from background threads; does not block the
 /// UI after the first resolution.
@@ -739,24 +745,24 @@ pub fn resolve_agent_binary() -> Result<String, String> {
 }
 
 fn resolve_agent_binary_uncached() -> Result<String, String> {
-    if let Ok(path) = std::env::var("CURSOR_AGENT") {
+    if let Ok(path) = std::env::var("PRIME_AGENT") {
         let path = path.trim();
         if looks_like_agent_binary(path) {
             return Ok(path.to_string());
         }
     }
 
-    if which("cursor-agent").is_some() {
-        return Ok("cursor-agent".into());
+    if which("prime-agent").is_some() {
+        return Ok("prime-agent".into());
     }
 
     Err(
-        "cursor-agent not found (set CURSOR_AGENT to a binary path or install cursor-agent on PATH)"
+        "prime-agent not found (set PRIME_AGENT to a binary path or install prime-agent on PATH)"
             .into(),
     )
 }
 
-/// True when `CURSOR_AGENT` looks like an executable override, not Cursor's `=1` flag.
+/// True when `PRIME_AGENT` looks like an executable override.
 fn looks_like_agent_binary(path: &str) -> bool {
     if path.is_empty() || path == "0" || path == "1" {
         return false;
@@ -764,81 +770,165 @@ fn looks_like_agent_binary(path: &str) -> bool {
     Path::new(path).is_file() || which(path).is_some()
 }
 
-/// Scan `~/.cursor/chats` for resumable sessions (newest first).
+/// Scan `~/.prime/agent/sessions` for resumable root sessions (newest first).
 pub fn list_saved_chats() -> Result<Vec<SavedChat>, String> {
-    let root = chats_root().ok_or_else(|| "HOME is unset; cannot find ~/.cursor/chats".to_string())?;
+    let root = subagents::sessions_root().ok_or_else(|| {
+        "HOME is unset; cannot find ~/.prime/agent/sessions".to_string()
+    })?;
     if !root.is_dir() {
         return Ok(Vec::new());
     }
 
     let mut chats = Vec::new();
-    let workspace_dirs = fs::read_dir(&root).map_err(|e| format!("read {}: {e}", root.display()))?;
-    for ws_entry in workspace_dirs.flatten() {
-        let ws_path = ws_entry.path();
-        if !ws_path.is_dir() {
+    let entries = fs::read_dir(&root).map_err(|e| format!("read {}: {e}", root.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let chat_dirs = match fs::read_dir(&ws_path) {
-            Ok(d) => d,
-            Err(_) => continue,
+        let Some(chat) = parse_saved_session(&path) else {
+            continue;
         };
-        for chat_entry in chat_dirs.flatten() {
-            let chat_path = chat_entry.path();
-            if !chat_path.is_dir() {
-                continue;
-            }
-            let meta_path = chat_path.join("meta.json");
-            if !meta_path.is_file() {
-                continue;
-            }
-            let Some(chat) = parse_saved_chat(&chat_path, &meta_path) else {
-                continue;
-            };
-            chats.push(chat);
-        }
+        chats.push(chat);
     }
 
     chats.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
     Ok(chats)
 }
 
-fn chats_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cursor").join("chats"))
-}
+fn parse_saved_session(path: &Path) -> Option<SavedChat> {
+    use std::io::{BufRead, BufReader};
 
-fn parse_saved_chat(chat_path: &Path, meta_path: &Path) -> Option<SavedChat> {
-    let text = fs::read_to_string(meta_path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-
-    // Empty shells (created but never prompted) are not useful to resume.
-    if value.get("hasConversation").and_then(|v| v.as_bool()) != Some(true) {
-        return None;
-    }
-    // Nested Task chats are opened from the parent session's task rows.
-    if value.get("isSubagent").and_then(|v| v.as_bool()) == Some(true) {
-        return None;
-    }
-
-    let id = chat_path.file_name()?.to_str()?.to_string();
-    let title = value
-        .get("title")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Untitled")
-        .to_string();
-    let cwd = value
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let updated_at_ms = value
-        .get("updatedAtMs")
-        .and_then(|v| v.as_u64())
-        .or_else(|| value.get("createdAtMs").and_then(|v| v.as_u64()))
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut id: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut first_user: Option<String> = None;
+    let mut has_user = false;
+    let mut is_child = false;
+    let mut updated_at_ms = path
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        })
         .unwrap_or(0);
+
+    for line in reader.lines().flatten() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(ts) = value.get("timestamp").and_then(|v| v.as_str()) {
+            // Prefer file mtime; bump if we can parse a later ISO stamp roughly via len.
+            let _ = ts;
+        }
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("session") => {
+                id = value
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                    });
+                cwd = value
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                if value.get("parentSession").and_then(|v| v.as_str()).is_some() {
+                    is_child = true;
+                }
+            }
+            Some("session_info") => {
+                if let Some(n) = value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    name = Some(n.to_string());
+                }
+            }
+            Some("message") => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+                    continue;
+                }
+                has_user = true;
+                if first_user.is_none() {
+                    first_user = match message.get("content") {
+                        Some(serde_json::Value::String(s)) => {
+                            let t = s.trim();
+                            (!t.is_empty()).then(|| t.to_string())
+                        }
+                        Some(serde_json::Value::Array(parts)) => {
+                            let mut out = String::new();
+                            for part in parts {
+                                if part.get("type").and_then(|v| v.as_str()) == Some("text") {
+                                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                                        if !out.is_empty() {
+                                            out.push(' ');
+                                        }
+                                        out.push_str(t.trim());
+                                    }
+                                }
+                            }
+                            let t = out.trim();
+                            (!t.is_empty()).then(|| t.to_string())
+                        }
+                        _ => None,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if is_child || !has_user {
+        return None;
+    }
+
+    let id = id.or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+    })?;
+    let title = name
+        .or(first_user)
+        .map(|s| {
+            const MAX: usize = 64;
+            if s.chars().count() > MAX {
+                let t: String = s.chars().take(MAX.saturating_sub(1)).collect();
+                format!("{t}…")
+            } else {
+                s
+            }
+        })
+        .unwrap_or_else(|| "Untitled".into());
+
+    // Prefer filesystem mtime as the sort key (cheap + accurate enough).
+    if let Ok(meta) = path.metadata() {
+        if let Ok(mtime) = meta.modified() {
+            updated_at_ms = mtime
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+        }
+    }
 
     Some(SavedChat {
         id,
@@ -916,15 +1006,8 @@ fn which(name: &str) -> Option<PathBuf> {
 fn build_args(draft: &NewSessionDraft, workspace: &Path) -> Vec<String> {
     let mut args = Vec::new();
 
-    args.push("--workspace".into());
+    args.push("--cwd".into());
     args.push(workspace.display().to_string());
-
-    if draft.trust {
-        args.push("--trust".into());
-    }
-    if draft.force {
-        args.push("--force".into());
-    }
 
     let model = draft.model.trim();
     if !model.is_empty() {
@@ -938,8 +1021,8 @@ fn build_args(draft: &NewSessionDraft, workspace: &Path) -> Vec<String> {
         args.push(chat_id.to_string());
     }
 
-    // Initial prompt still applies when resuming a freshly created empty chat.
-    // Images are not passed here: `--image` is headless-only; see ComposerSeed.
+    // Initial prompt for new sessions (ignored usefully when resuming with empty prompt).
+    // Images are injected via ComposerSeed (clipboard + ^V), not CLI args.
     let prompt = draft.prompt.trim();
     if !prompt.is_empty() {
         args.push(prompt.to_string());

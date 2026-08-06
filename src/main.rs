@@ -1,4 +1,4 @@
-//! Desktop multi-agent manager for cursor-agent.
+//! Desktop multi-agent manager for prime-agent.
 
 mod app;
 mod auth;

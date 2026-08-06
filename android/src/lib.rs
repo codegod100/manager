@@ -1,7 +1,7 @@
 //! Agent Manager — Android NativeActivity (`android_main`).
 //!
 //! Desktop sessions use the root crate (`cargo run` / `nix run`). This package
-//! is cargo-apk only: egui_term / cursor-agent PTYs are Linux-desktop.
+//! is cargo-apk only: egui_term / prime-agent PTYs are Linux-desktop.
 
 mod app;
 

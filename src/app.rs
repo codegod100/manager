@@ -26,13 +26,13 @@ use vidya::Theme;
 
 /// JetBrains Mono — includes `→` at the same advance as ASCII, unlike egui’s
 /// default monospace + vidya’s proportional symbol fallback (which overflows
-/// into the block-cursor cell on cursor-agent’s “→ Add a follow-up” line).
+/// into the block-cursor cell on prime-agent’s follow-up / editor line).
 const TERM_FONT_TTF: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
 const TERM_FONT_NAME: &str = "jetbrains-mono";
 const TERM_FONT_SIZE: f32 = 14.0;
 
 /// DejaVu braille + Noto `⌕` — glyphs JetBrains + egui defaults lack
-/// (cursor-agent spinner / Find icon). See `assets/NOTICE` /
+/// (agent spinner / Find icon). See `assets/NOTICE` /
 /// `scripts/rebuild-term-symbols-ttf.sh`.
 const TERM_SYMBOLS_TTF: &[u8] = include_bytes!("../assets/term-symbols.ttf");
 const TERM_SYMBOLS_NAME: &str = "term-symbols";
@@ -119,8 +119,6 @@ struct ResumeDialog {
     chats: Vec<SavedChat>,
     selected: Option<String>,
     model: String,
-    trust: bool,
-    force: bool,
     load_error: Option<String>,
     /// True while `list_saved_chats` runs off-thread.
     loading: bool,
@@ -138,7 +136,7 @@ struct ConvertDialog {
     bash: String,
     nushell: String,
     error: Option<String>,
-    /// True while cursor-agent `--print` convert runs off-thread.
+    /// True while prime-agent `--print` convert runs off-thread.
     converting: bool,
     /// Request focus on the bash field once when opened.
     focus: bool,
@@ -200,8 +198,6 @@ impl ResumeDialog {
             chats: Vec::new(),
             selected: None,
             model: String::new(),
-            trust: true,
-            force: false,
             load_error: None,
             loading: true,
         }
@@ -257,8 +253,6 @@ impl ResumeDialog {
             model: self.model.clone(),
             prompt: String::new(),
             images: Vec::new(),
-            trust: self.trust,
-            force: self.force,
             resume_chat_id: Some(chat.id.clone()),
             tab_title: Some(chat.title.clone()),
         })
@@ -616,6 +610,13 @@ impl App {
             }
         }
 
+        // Bind brand-new PTYs to the session file prime-agent just created.
+        for session in self.sessions.values_mut() {
+            if let Some(local) = session.as_local_mut() {
+                let _ = local.try_bind_session_id();
+            }
+        }
+
         let watches: Vec<ChatWatch> = self
             .sessions
             .iter()
@@ -931,8 +932,6 @@ impl App {
             model: String::new(),
             prompt: String::new(),
             images: Vec::new(),
-            trust: true,
-            force: false,
             resume_chat_id: Some(chat_id),
             tab_title: Some(title),
         };
@@ -1652,7 +1651,7 @@ impl App {
                 vidya::dim_label(
                     ui,
                     &theme,
-                    "Paste bash on the left; Convert runs cursor-agent (ask mode).",
+                    "Paste bash on the left; Convert runs prime-agent (--print).",
                 );
                 ui.add_space(theme.spacing.sm);
 
@@ -1835,7 +1834,7 @@ impl App {
             .min_width(320.0)
             .min_height(280.0)
             .show(ctx, |ui| {
-                vidya::title_2(ui, &theme, "Launch cursor-agent");
+                vidya::title_2(ui, &theme, "Launch prime-agent");
                 ui.add_space(theme.spacing.sm);
                 vidya::dim_label(ui, &theme, "Workspace");
                 vidya::text_field_singleline(ui, &theme, &mut draft.workspace);
@@ -1844,8 +1843,8 @@ impl App {
                 vidya::text_field_singleline(ui, &theme, &mut draft.model);
                 ui.add_space(theme.spacing.sm);
                 vidya::dim_label(ui, &theme, "Initial prompt (optional)");
-                // Leave room for checkboxes + error + footer; grow prompt with the window.
-                let below = theme.spacing.control_height * 3.0
+                // Leave room for error + footer; grow prompt with the window.
+                let below = theme.spacing.control_height
                     + theme.spacing.md * 2.0
                     + theme.spacing.sm * 3.0
                     + if draft.images.is_empty() { 0.0 } else { 72.0 }
@@ -1859,9 +1858,6 @@ impl App {
                     ui.add_space(theme.spacing.sm);
                     self.show_prompt_images(ui, &theme, &mut draft.images);
                 }
-                ui.add_space(theme.spacing.sm);
-                vidya::checkbox(ui, &theme, &mut draft.trust, "Trust workspace (--trust)");
-                vidya::checkbox(ui, &theme, &mut draft.force, "Force / yolo (--force)");
 
                 if let Some(err) = &error {
                     ui.add_space(theme.spacing.sm);
@@ -2054,11 +2050,6 @@ impl App {
                     ui.add_space(theme.spacing.sm);
                     vidya::text_field_singleline(ui, &theme, &mut dialog.model);
                 });
-                ui.horizontal(|ui| {
-                    vidya::checkbox(ui, &theme, &mut dialog.trust, "Trust");
-                    ui.add_space(theme.spacing.sm);
-                    vidya::checkbox(ui, &theme, &mut dialog.force, "Force");
-                });
 
                 if let Some(err) = &error {
                     ui.add_space(theme.spacing.xs);
@@ -2214,13 +2205,13 @@ impl App {
                     vidya::dim_label(
                         ui,
                         &theme,
-                        "New session opens an interactive cursor-agent PTY.",
+                        "New session opens an interactive prime-agent PTY.",
                     );
                     ui.add_space(theme.spacing.xs);
                     vidya::dim_label(
                         ui,
                         &theme,
-                        "Cloud watches remote agents; Resume reopens ~/.cursor/chats.",
+                        "Cloud watches Cursor remote agents; Resume reopens ~/.prime/agent/sessions.",
                     );
                 });
             });
@@ -2230,7 +2221,7 @@ impl App {
     ///
     /// egui-winit treats Ctrl+V as a paste shortcut and only emits `Event::Paste` when the
     /// clipboard has text. Image-only clipboards therefore produce neither Paste nor a Key
-    /// press — only the Key *release* survives. We send `^V` on that release (cursor-agent
+    /// press — only the Key *release* survives. We send `^V` on that release (prime-agent
     /// then reads the image via wl-paste/xclip). Text pastes are also deferred to release:
     /// we drop the egui Paste event so egui_term does not double-send `^V`.
     fn handle_agent_paste(&mut self, ctx: &egui::Context) {
@@ -3861,7 +3852,7 @@ fn show_term_scrollbar(
 
 /// Register JetBrains Mono under its own family so egui_term never picks up
 /// vidya’s proportional `→` fallback on `FontFamily::Monospace`, then attach
-/// symbol/emoji supplements for cursor-agent icons (`⌕`, `🔍`, …).
+/// symbol/emoji supplements for agent icons (`⌕`, `🔍`, …).
 fn install_term_font(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 

@@ -1,4 +1,4 @@
-//! Read/write clipboard images the same way cursor-agent does (`wl-paste` / `xclip`).
+//! Read/write clipboard images the same way prime-agent does (`wl-paste` / `xclip`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -70,7 +70,7 @@ pub fn capture_clipboard_image() -> Option<PathBuf> {
     None
 }
 
-/// Put an image file on the system clipboard so cursor-agent can attach it via `^V`.
+/// Put an image file on the system clipboard so prime-agent can attach it via `^V`.
 pub fn set_clipboard_image(path: &Path) -> bool {
     let Ok(bytes) = fs::read(path) else {
         return false;
