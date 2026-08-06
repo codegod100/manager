@@ -1,8 +1,9 @@
 //! Agent Manager Android shell (vidya chrome).
 //!
 //! Full multi-agent PTY sessions stay on the desktop build — egui_term needs a
-//! Unix PTY and `cursor-agent` on PATH. This APK ships the branded UI so the
-//! package installs and launches on phone / Waydroid.
+//! Unix PTY. The flake puts `cursor-agent` on PATH for `nix run` / the packaged
+//! desktop app. This APK ships the branded UI for phone / Waydroid / emulator
+//! smoke tests.
 
 use eframe::egui::{self, Align, Layout, RichText, ScrollArea};
 use vidya::{
@@ -92,9 +93,9 @@ impl eframe::App for ManagerShell {
                                     body(
                                         ui,
                                         &self.theme,
-                                        "Agent Manager embeds cursor-agent in live PTYs \
-                                         (egui_term). That stack needs a Linux desktop with \
-                                         cursor-agent on PATH — not available inside this APK.",
+                                        "Interactive cursor-agent PTYs (egui_term) need a \
+                                         Linux desktop — they are not in this APK. The flake \
+                                         already wraps cursor-agent into PATH for desktop runs.",
                                     );
                                     ui.add_space(self.theme.spacing.md);
                                     body(
@@ -102,7 +103,7 @@ impl eframe::App for ManagerShell {
                                         &self.theme,
                                         "On your machine:\n\
                                          • nix run .#desktop\n\
-                                         • or: cargo run --release",
+                                         • nix develop && cargo run --release",
                                     );
                                 });
 
