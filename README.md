@@ -35,9 +35,9 @@ nix build .#manager
 #       result/share/icons/hicolor/.../apps/manager.{svg,png}
 ```
 
-**New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. It runs `cursor-agent create-chat`, then spawns the PTY with `--resume <chatId>` so the session is bound to Cursor’s chat store. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`.
+**New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. It runs `cursor-agent create-chat`, then spawns the PTY with `--resume <chatId>` so the session is bound to Cursor’s chat store. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`. **Cloud** lists and launches [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) via the API (`CURSOR_API_KEY` from [cursor.com/dashboard/api](https://cursor.com/dashboard/api)) — watch-only tabs poll agent status and open `cursor.com/agents/<bc-id>` in the browser (no local PTY).
 
-The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests Tasks under each session (from `agent-transcripts/<chatId>/`, `subagents/`, and Task records in the chat store). Click a session to focus its terminal; click a Task to open its nested chat (`isSubagent`) in a new tab when Cursor created one, or focus the parent if not. Right-click a session for rename. **Close** removes the active session.
+The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests Tasks under each session (from `agent-transcripts/<chatId>/`, `subagents/`, and Task records in the chat store). Cloud agents show a ☁ marker. Click a session to focus its terminal; cloud tabs show a status panel instead. Click a Task to open its nested chat (`isSubagent`) in a new tab when Cursor created one, or focus the parent if not. Right-click a session for rename. **Close** removes the active session.
 
 **Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager types `@/path.png` into the TUI composer (so the agent attaches it synchronously), then types the initial prompt and submits. `--image` is headless-only, so interactive sessions cannot rely on it.
 
@@ -58,8 +58,27 @@ nix run .#apk -- --release --target aarch64-linux-android
 
 - Rust toolchain (provided by `nix develop`)
 - `cursor-agent` on `PATH` (flake wraps it in; or set `CURSOR_AGENT` to an executable path; Cursor’s in-session `CURSOR_AGENT=1` flag is ignored)
+- `CURSOR_API_KEY` for **Cloud** (API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api))
 - Linux (Wayland or X11)
 - `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste (also in the flake)
+
+### Cursor API key (OIDC)
+
+Agent Manager can load `CURSOR_API_KEY` for spawned `cursor-agent` PTY children via OpenBao:
+
+1. **Utils → Cursor sign-in (OIDC)** (or the header **Cursor: sign in** button)
+2. OIDC login to your OpenBao server (default `https://openbao.boxd.sh`, mount `oidc`)
+3. Read `CURSOR_API_KEY` from KV `secret/data/ai-api-keys`
+
+On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is exported for child processes. On next launch, a stored token is restored automatically when `CURSOR_API_KEY` is not already set.
+
+| Variable | Purpose |
+|----------|---------|
+| `BAO_ADDR` / `VAULT_ADDR` | OpenBao server (default `https://openbao.boxd.sh`) |
+| `BAO_TOKEN` / `VAULT_TOKEN` | Skip OIDC and use a token directly |
+| `BAO_OIDC_MOUNT` / `BAO_OIDC_ROLE` | OIDC auth mount and role |
+| `MANAGER_OIDC_PORT` | Local callback port (default `8251`) |
+| `CURSOR_API_KEY` | If already set, OIDC sign-in is optional |
 
 ## Nix
 

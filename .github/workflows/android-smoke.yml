@@ -1,0 +1,105 @@
+name: Android smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: android-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      emulator:
+        image: budtmo/docker-android:emulator_13.0
+        ports:
+          - 5555:5555
+          - 5554:5554
+        options: >-
+          --privileged
+          --device /dev/kvm
+          -e "EMULATOR_DEVICE=Samsung Galaxy S10"
+          -e WEB_VNC=false
+          -e APPIUM=false
+          -e AUTO_RECORD=false
+          -e ENFORCE_DEV_MODE=false
+
+    steps:
+      - name: Checkout manager
+        uses: actions/checkout@v4
+
+      - name: Checkout vidya (path dep)
+        run: |
+          set -euo pipefail
+          VIDYA_DIR="$(dirname "$GITHUB_WORKSPACE")/vidya"
+          if [[ ! -d "$VIDYA_DIR/.git" ]]; then
+            git clone --depth 1 https://tangled.org/nandi.uk/vidya "$VIDYA_DIR"
+          fi
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/
+            ~/.cargo/git/
+          key: cargo-apk-${{ runner.os }}-${{ hashFiles('android/Cargo.lock') }}
+          restore-keys: |
+            cargo-apk-${{ runner.os }}-
+
+      - name: Cache Android SDK / NDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/android-sdk
+            ~/.local/share/android-ndk-r29
+          key: android-sdk-ndk-${{ runner.os }}-r29
+          restore-keys: |
+            android-sdk-ndk-${{ runner.os }}-
+
+      - name: Setup Android build toolchain
+        run: ./scripts/ci-setup-android.sh
+
+      - name: Build debug APK (x86_64 emulator)
+        run: |
+          set -euo pipefail
+          export MANAGER_ANDROID_TARGET=x86_64-linux-android
+          APK="$(./scripts/build-apk.sh --target x86_64-linux-android)"
+          echo "APK=$APK" >> "$GITHUB_ENV"
+          ls -lh "$APK"
+
+      - name: Install adb client
+        run: sudo apt-get update && sudo apt-get install -y android-tools-adb
+
+      - name: Smoke test on docker-android emulator
+        run: ./scripts/android-smoke.sh "$APK"
+
+      - name: Upload logcat on failure
+        if: failure()
+        run: adb -s localhost:5555 logcat -d > logcat.txt || true
+
+      - name: Upload smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-smoke-debug
+          path: logcat.txt
+          if-no-files-found: ignore

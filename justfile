@@ -25,3 +25,7 @@ apk-release:
 
 apk-release-x86:
     ./scripts/build-apk.sh --release --target x86_64-linux-android
+
+# Install + launch on adb device (docker-android: adb connect localhost:5555)
+android-smoke apk:
+    ./scripts/android-smoke.sh {{apk}}
