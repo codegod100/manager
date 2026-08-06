@@ -15,6 +15,7 @@ IMAGE="${DOCKER_ANDROID_IMAGE:-budtmo/docker-android:emulator_13.0}"
 CONTAINER="${DOCKER_ANDROID_CONTAINER:-manager-android-emulator}"
 DEVICE="${EMULATOR_DEVICE:-Samsung Galaxy S10}"
 ADB_PORT="${DOCKER_ANDROID_ADB_PORT:-5555}"
+CONSOLE_PORT="${DOCKER_ANDROID_CONSOLE_PORT:-}"
 VNC_PORT="${DOCKER_ANDROID_VNC_PORT:-6080}"
 WEB_VNC="${DOCKER_ANDROID_WEB_VNC:-true}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-600}"
@@ -37,6 +38,7 @@ Env:
   DOCKER_ANDROID_CONTAINER   default manager-android-emulator
   EMULATOR_DEVICE            default Samsung Galaxy S10
   DOCKER_ANDROID_ADB_PORT      default 5555
+  DOCKER_ANDROID_CONSOLE_PORT  optional host port for emulator console (default: not published)
   DOCKER_ANDROID_VNC_PORT      default 6080
   DOCKER_ANDROID_WEB_VNC       default true (browser UI on VNC port)
 EOF
@@ -79,30 +81,81 @@ container_exists() {
   docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"
 }
 
+port_listeners() {
+  local port="$1"
+  if command -v ss >/dev/null; then
+    ss -H -ltn "sport = :$port" 2>/dev/null || true
+  elif command -v lsof >/dev/null; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+  fi
+}
+
+port_in_use() {
+  port_listeners "$1" | grep -q .
+}
+
+find_port_owner() {
+  local port="$1"
+  docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | grep -E ":${port}->" || port_listeners "$port" || true
+}
+
+check_host_port() {
+  local port="$1" label="$2"
+  if port_in_use "$port"; then
+    echo "error: host port $port ($label) already in use" >&2
+    find_port_owner "$port" | sed 's/^/  /' >&2
+    echo "  stop the other emulator/container, or set a different host port (e.g. DOCKER_ANDROID_ADB_PORT=5556)" >&2
+    return 1
+  fi
+  return 0
+}
+
 cmd_start() {
   need_docker
   warn_kvm
 
+  local started=0
   if container_running; then
     echo "already running: $CONTAINER" >&2
+    started=1
   elif container_exists; then
     echo "→ docker start $CONTAINER" >&2
-    docker start "$CONTAINER"
-  else
+    if docker start "$CONTAINER" >/dev/null 2>&1; then
+      started=1
+    else
+      echo "→ removing stale $CONTAINER" >&2
+      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [[ "$started" -eq 0 ]]; then
+    check_host_port "$VNC_PORT" "VNC" || exit 1
+    check_host_port "$ADB_PORT" "ADB" || exit 1
+    if [[ -n "$CONSOLE_PORT" ]]; then
+      check_host_port "$CONSOLE_PORT" "emulator console" || exit 1
+    fi
+
     echo "→ docker run $IMAGE" >&2
-    docker run -d \
+    if [[ -z "$CONSOLE_PORT" ]]; then
+      echo "  (host port 5554 not published — smoke tests use adb on localhost:${ADB_PORT})" >&2
+    fi
+    if ! docker run -d \
       --name "$CONTAINER" \
       --privileged \
       --device /dev/kvm \
       -p "${VNC_PORT}:6080" \
       -p "${ADB_PORT}:5555" \
-      -p 5554:5554 \
+      ${CONSOLE_PORT:+-p "${CONSOLE_PORT}:5554"} \
       -e "EMULATOR_DEVICE=${DEVICE}" \
       -e "WEB_VNC=${WEB_VNC}" \
       -e APPIUM=false \
       -e AUTO_RECORD=false \
       -e ENFORCE_DEV_MODE=false \
-      "$IMAGE"
+      "$IMAGE"; then
+      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      echo "docker run failed — check: docker ps --format '{{.Names}} {{.Ports}}'" >&2
+      exit 1
+    fi
   fi
 
   echo "" >&2
