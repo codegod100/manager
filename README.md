@@ -97,7 +97,7 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `packages.desktop` | Wrapper that launches the packaged `.desktop` |
 | `packages.prime-agent` | Prime Agent CLI (from [codegod100/agentic](https://github.com/codegod100/agentic)) |
 | `packages.android-sdk` | Hermetic Android SDK+NDK (opt-in; not on desktop package closure) |
-| `devShells.default` | Host rust + GUI libs + prime-agent + clipboard (no SDK/NDK) |
+| `devShells.default` | Host rust (minimal+clippy/rustfmt) + egui libs + prime-agent + clipboard |
 | `devShells.android` | Android rust targets + cargo-apk + hermetic SDK/NDK |
 | `assets/manager.svg` | App icon source |
 

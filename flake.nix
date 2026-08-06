@@ -68,9 +68,10 @@
         ];
 
       # Host-only toolchain for desktop develop / nix run (no Android targets).
+      # Use `minimal` so rust-docs (~700MiB) are not pulled into every shell/app.
       rustDesktop =
         pkgs:
-        pkgs.rust-bin.stable.latest.default.override {
+        pkgs.rust-bin.stable.latest.minimal.override {
           extensions = [
             "rustfmt"
             "clippy"
@@ -315,16 +316,20 @@
           ];
           rust = rustDesktop pkgs;
 
-          # Desktop cargo apps: host Rust only (no Android targets / SDK).
+          # Host Rust only (no Android targets / SDK). GTK stays off cargo build/run.
           cargoTools = [
             rust
             pkgs.pkg-config
-            pkgs.librsvg
-            pkgs.gtk3
-            pkgs.desktop-file-utils # update-desktop-database
             pkgs.just
           ]
           ++ agentPathBins;
+
+          # gtk-launch + FreeDesktop icon install only (apps.desktop).
+          desktopTools = cargoTools ++ [
+            pkgs.librsvg
+            pkgs.gtk3
+            pkgs.desktop-file-utils # update-desktop-database
+          ];
 
           # Local cargo build (devshell tools; no pure sandbox / remote upload lock).
           build = pkgs.writeShellApplication {
@@ -357,7 +362,7 @@
           # can resolve Icon= by app_id), then gtk-launch.
           desktopApp = pkgs.writeShellApplication {
             name = "manager-desktop";
-            runtimeInputs = cargoTools;
+            runtimeInputs = desktopTools;
             text = ''
               ${cargoPreamble libPath}
               export PATH="${lib.makeBinPath agentPathBins}:$PATH"
@@ -466,14 +471,11 @@
           android = androidFor pkgs;
         in
         {
-          # Desktop: host Rust + GUI libs + prime-agent. No SDK/NDK.
+          # Desktop: host Rust + egui link libs + prime-agent. No SDK/NDK / GTK.
           default = pkgs.mkShell {
             packages = [
               rust
               pkgs.pkg-config
-              pkgs.librsvg
-              pkgs.gtk3
-              pkgs.desktop-file-utils
               pkgs.just
               prime-agent
               pkgs.wl-clipboard
