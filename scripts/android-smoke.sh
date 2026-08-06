@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Install APK on docker-android (or any adb device) and verify NativeActivity launch.
+#
+# Long-press (text select) can be simulated after launch with:
+#   ADB_SERIAL=localhost:5555 scripts/android-longpress.sh <x> <y>
+# (zero-distance `adb shell input swipe X Y X Y 1000`).
 set -euo pipefail
 
 APK="${1:?usage: android-smoke.sh <apk>}"
