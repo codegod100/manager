@@ -1,6 +1,40 @@
 {
   "nodes": {
+    "agentic": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1786027409,
+        "narHash": "sha256-LgJ1F8MVhsVyt1PgjJSFmokf39PaejKrKeloNs0HcvY=",
+        "owner": "codegod100",
+        "repo": "agentic",
+        "rev": "3298a8397e7266ddf6cea87faed1d32b8808f029",
+        "type": "github"
+      },
+      "original": {
+        "owner": "codegod100",
+        "repo": "agentic",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
+      "locked": {
+        "lastModified": 1784356753,
+        "narHash": "sha256-12KrbMiWLcf8m7pCvAtZh1ZrgF85ZXDXvfR/fWTKy84=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "61b7c44c4073f0b827768aff0049561b5110ea5a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_2": {
       "locked": {
         "lastModified": 1785454630,
         "narHash": "sha256-LQy14TZp77TwbQf40gg1V3jo8FwJG0jGDkAH+zRHqg8=",
@@ -18,7 +52,8 @@
     },
     "root": {
       "inputs": {
-        "nixpkgs": "nixpkgs",
+        "agentic": "agentic",
+        "nixpkgs": "nixpkgs_2",
         "rust-overlay": "rust-overlay",
         "vidya": "vidya"
       }

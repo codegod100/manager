@@ -57,16 +57,10 @@ nix run .#apk -- --release --target aarch64-linux-android
 ## Requirements
 
 - Rust toolchain (provided by `nix develop`)
-- [`prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent) on `PATH` (or set `PRIME_AGENT` to an executable path)
+- [`prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent) on `PATH` (flake wraps it in from [`codegod100/agentic`](https://github.com/codegod100/agentic); or set `PRIME_AGENT` to an executable path)
 - `CURSOR_API_KEY` for **Cloud** only (API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api))
 - Linux (Wayland or X11)
 - `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste (also in the flake)
-
-Install prime-agent (example):
-
-```bash
-curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
-```
 
 ### Cursor API key (OIDC) — Cloud tabs
 
@@ -96,15 +90,17 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `apps.manager` | Devshell: cargo build + run binary only |
 | `apps.build` | Devshell: `cargo build --release` only |
 | `apps.apk` | Hermetic cargo-apk build (`--release`, `--target`, …) |
+| `apps.prime-agent` | Run the packaged Prime Agent CLI |
 | `apps.package` | Pure store binary |
 | `apps.package-desktop` | Pure package via its `.desktop` |
-| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes clipboard tools) |
+| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes prime-agent + clipboard tools) |
 | `packages.desktop` | Wrapper that launches the packaged `.desktop` |
+| `packages.prime-agent` | Prime Agent CLI (from [codegod100/agentic](https://github.com/codegod100/agentic)) |
 | `packages.android-sdk` | Hermetic Android SDK+NDK used by APK builds |
-| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + clipboard |
+| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + prime-agent + clipboard |
 | `assets/manager.svg` | App icon source |
 
-Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds. Install `prime-agent` on the host (not packaged by this flake).
+Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds. Binary cache: `codegod100.cachix.org` (configured via `nixConfig`).
 
 ## Notes
 
