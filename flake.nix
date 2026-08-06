@@ -67,6 +67,84 @@
           libxrandr
         ];
 
+      # Host-only toolchain for desktop develop / nix run (no Android targets).
+      # Use `minimal` so rust-docs (~700MiB) are not pulled into every shell/app.
+      rustDesktop =
+        pkgs:
+        pkgs.rust-bin.stable.latest.minimal.override {
+          extensions = [
+            "rustfmt"
+            "clippy"
+          ];
+        };
+
+      # Cross toolchain + hermetic SDK/NDK — only for APK / android shell.
+      androidFor =
+        pkgs:
+        let
+          composition = pkgs.androidenv.composeAndroidPackages {
+            platformVersions = [ "34" ];
+            buildToolsVersions = [ "34.0.0" ];
+            includeNDK = true;
+            includeEmulator = false;
+            includeSystemImages = false;
+          };
+          sdk = composition.androidsdk;
+          sdkRoot = "${sdk}/libexec/android-sdk";
+          rust = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [
+              "rust-src"
+              "rustfmt"
+              "clippy"
+            ];
+            targets = [
+              "aarch64-linux-android"
+              "x86_64-linux-android"
+            ];
+          };
+        in
+        {
+          inherit sdk sdkRoot rust;
+          env = ''
+            export ANDROID_HOME="''${ANDROID_HOME:-${sdkRoot}}"
+            export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${sdkRoot}/ndk-bundle}"
+            export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
+            # cargo-apk prefers ANDROID_HOME; avoid ANDROID_SDK_ROOT clashes.
+            unset ANDROID_SDK_ROOT 2>/dev/null || true
+            if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
+              ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
+              if [[ -n "''${ndk:-}" && -d "$ndk" ]]; then
+                export ANDROID_NDK_HOME="$ndk"
+                export ANDROID_NDK_ROOT="$ndk"
+              fi
+            fi
+            if [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
+              export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+            elif [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin" ]]; then
+              export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin:$PATH"
+            fi
+            export CC_aarch64_linux_android="''${CC_aarch64_linux_android:-aarch64-linux-android28-clang}"
+            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="''${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-$CC_aarch64_linux_android}"
+            export AR_aarch64_linux_android="''${AR_aarch64_linux_android:-llvm-ar}"
+            export CC_x86_64_linux_android="''${CC_x86_64_linux_android:-x86_64-linux-android28-clang}"
+            export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="''${CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER:-$CC_x86_64_linux_android}"
+            export AR_x86_64_linux_android="''${AR_x86_64_linux_android:-llvm-ar}"
+          '';
+          tools = [
+            rust
+            pkgs.cargo-apk
+            pkgs.jdk17_headless
+            pkgs.android-tools
+            pkgs.just
+            pkgs.findutils
+            pkgs.gawk
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.coreutils
+            pkgs.bash
+          ];
+        };
+
       # Shared by cargo apps: enter checkout + set link path.
       cargoPreamble = libPath: ''
         set -euo pipefail
@@ -133,18 +211,6 @@
             pkgs.wl-clipboard
             pkgs.xclip
           ];
-
-          # Minimal Android SDK + NDK for cargo-apk (phone / Waydroid).
-          androidComposition = pkgs.androidenv.composeAndroidPackages {
-            platformVersions = [ "34" ];
-            buildToolsVersions = [ "34.0.0" ];
-            includeNDK = true;
-            includeEmulator = false;
-            includeSystemImages = false;
-          };
-          androidSdk = androidComposition.androidsdk;
-          androidSdkRoot = "${androidSdk}/libexec/android-sdk";
-
           # Packaged binary for `nix build` / install — pure, remote-builder capable.
           srcTree = pkgs.runCommand "manager-src" { } ''
             mkdir -p $out/manager $out/vidya
@@ -229,8 +295,9 @@
           manager = manager;
           desktop = desktop;
           prime-agent = prime-agent;
-          # Expose the hermetic SDK so scripts can `nix build .#android-sdk`.
-          android-sdk = androidSdk;
+          # Opt-in: hermetic SDK/NDK (`nix build .#android-sdk`). Not on the
+          # desktop package/runtime closure.
+          android-sdk = (androidFor pkgs).sdk;
         }
       );
 
@@ -247,77 +314,22 @@
             pkgs.wl-clipboard
             pkgs.xclip
           ];
+          rust = rustDesktop pkgs;
 
-          androidComposition = pkgs.androidenv.composeAndroidPackages {
-            platformVersions = [ "34" ];
-            buildToolsVersions = [ "34.0.0" ];
-            includeNDK = true;
-            includeEmulator = false;
-            includeSystemImages = false;
-          };
-          androidSdkRoot = "${androidComposition.androidsdk}/libexec/android-sdk";
-
-          rustAndroid = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "rustfmt"
-              "clippy"
-            ];
-            targets = [
-              "aarch64-linux-android"
-              "x86_64-linux-android"
-            ];
-          };
-
+          # Host Rust only (no Android targets / SDK). GTK stays off cargo build/run.
           cargoTools = [
-            rustAndroid
+            rust
             pkgs.pkg-config
-            pkgs.librsvg
-            pkgs.gtk3
-            pkgs.desktop-file-utils # update-desktop-database
             pkgs.just
           ]
           ++ agentPathBins;
 
-          androidTools = [
-            rustAndroid
-            pkgs.cargo-apk
-            pkgs.jdk17_headless
-            pkgs.android-tools
-            pkgs.just
-            pkgs.findutils
-            pkgs.gawk
-            pkgs.gnugrep
-            pkgs.gnused
-            pkgs.coreutils
-            pkgs.bash
+          # gtk-launch + FreeDesktop icon install only (apps.desktop).
+          desktopTools = cargoTools ++ [
+            pkgs.librsvg
+            pkgs.gtk3
+            pkgs.desktop-file-utils # update-desktop-database
           ];
-
-          androidEnv = ''
-            export ANDROID_HOME="''${ANDROID_HOME:-${androidSdkRoot}}"
-            export ANDROID_NDK_HOME="''${ANDROID_NDK_HOME:-${androidSdkRoot}/ndk-bundle}"
-            export ANDROID_NDK_ROOT="''${ANDROID_NDK_ROOT:-$ANDROID_NDK_HOME}"
-            # cargo-apk prefers ANDROID_HOME; avoid ANDROID_SDK_ROOT clashes.
-            unset ANDROID_SDK_ROOT 2>/dev/null || true
-            if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
-              ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
-              if [[ -n "''${ndk:-}" && -d "$ndk" ]]; then
-                export ANDROID_NDK_HOME="$ndk"
-                export ANDROID_NDK_ROOT="$ndk"
-              fi
-            fi
-            if [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
-              export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-            elif [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin" ]]; then
-              export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin:$PATH"
-            fi
-            export CC_aarch64_linux_android="''${CC_aarch64_linux_android:-aarch64-linux-android28-clang}"
-            export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="''${CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER:-$CC_aarch64_linux_android}"
-            export AR_aarch64_linux_android="''${AR_aarch64_linux_android:-llvm-ar}"
-            export CC_x86_64_linux_android="''${CC_x86_64_linux_android:-x86_64-linux-android28-clang}"
-            export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="''${CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER:-$CC_x86_64_linux_android}"
-            export AR_x86_64_linux_android="''${AR_x86_64_linux_android:-llvm-ar}"
-          '';
 
           # Local cargo build (devshell tools; no pure sandbox / remote upload lock).
           build = pkgs.writeShellApplication {
@@ -350,7 +362,7 @@
           # can resolve Icon= by app_id), then gtk-launch.
           desktopApp = pkgs.writeShellApplication {
             name = "manager-desktop";
-            runtimeInputs = cargoTools;
+            runtimeInputs = desktopTools;
             text = ''
               ${cargoPreamble libPath}
               export PATH="${lib.makeBinPath agentPathBins}:$PATH"
@@ -386,22 +398,27 @@
           };
 
           # Iterative APK: flake SDK/NDK + rust-overlay android targets + cargo-apk.
-          apkApp = pkgs.writeShellApplication {
-            name = "manager-apk";
-            runtimeInputs = androidTools;
-            text = ''
-              set -euo pipefail
-              ${androidEnv}
-              if [ ! -f Cargo.toml ] && [ -f "''${FLAKE_ROOT:-}/Cargo.toml" ]; then
-                cd "$FLAKE_ROOT"
-              fi
-              if [ ! -f android/Cargo.toml ]; then
-                echo "manager: run from the manager checkout (need android/Cargo.toml)" >&2
-                exit 1
-              fi
-              exec ./scripts/build-apk.sh "$@"
-            '';
-          };
+          # Android tooling is scoped here so desktop apps do not force the SDK.
+          apkApp =
+            let
+              android = androidFor pkgs;
+            in
+            pkgs.writeShellApplication {
+              name = "manager-apk";
+              runtimeInputs = android.tools;
+              text = ''
+                set -euo pipefail
+                ${android.env}
+                if [ ! -f Cargo.toml ] && [ -f "''${FLAKE_ROOT:-}/Cargo.toml" ]; then
+                  cd "$FLAKE_ROOT"
+                fi
+                if [ ! -f android/Cargo.toml ]; then
+                  echo "manager: run from the manager checkout (need android/Cargo.toml)" >&2
+                  exit 1
+                fi
+                exec ./scripts/build-apk.sh "$@"
+              '';
+            };
         in
         {
           # Default: cargo build + gtk-launch .desktop (icon + FreeDesktop metadata).
@@ -450,72 +467,44 @@
           inherit (pkgs) lib;
           libs = eguiLibs pkgs;
           prime-agent = agentic.packages.${system}.prime-agent;
-
-          androidComposition = pkgs.androidenv.composeAndroidPackages {
-            platformVersions = [ "34" ];
-            buildToolsVersions = [ "34.0.0" ];
-            includeNDK = true;
-            includeEmulator = false;
-            includeSystemImages = false;
-          };
-          androidSdkRoot = "${androidComposition.androidsdk}/libexec/android-sdk";
-
-          rustAndroid = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "rust-src"
-              "rustfmt"
-              "clippy"
-            ];
-            targets = [
-              "aarch64-linux-android"
-              "x86_64-linux-android"
-            ];
-          };
+          rust = rustDesktop pkgs;
+          android = androidFor pkgs;
         in
         {
+          # Desktop: host Rust + egui link libs + prime-agent. No SDK/NDK / GTK.
           default = pkgs.mkShell {
             packages = [
-              rustAndroid
+              rust
               pkgs.pkg-config
-              pkgs.librsvg
               pkgs.just
-              pkgs.cargo-apk
-              pkgs.jdk17_headless
-              pkgs.android-tools
               prime-agent
               pkgs.wl-clipboard
               pkgs.xclip
             ];
             buildInputs = libs;
             LD_LIBRARY_PATH = lib.makeLibraryPath libs;
-            # Hermetic SDK/NDK (override with env if you prefer a host install).
-            ANDROID_HOME = androidSdkRoot;
-            ANDROID_SDK_ROOT = androidSdkRoot;
-            ANDROID_NDK_HOME = "${androidSdkRoot}/ndk-bundle";
-            ANDROID_NDK_ROOT = "${androidSdkRoot}/ndk-bundle";
             shellHook = ''
               export PATH="${prime-agent}/bin:$PATH"
-              # Prefer versioned NDK if ndk-bundle is missing.
-              if [[ ! -d "$ANDROID_NDK_HOME" ]]; then
-                ndk="$(echo "$ANDROID_HOME"/ndk/* | awk '{print $1}')"
-                if [[ -n "''${ndk:-}" && -d "$ndk" ]]; then
-                  export ANDROID_NDK_HOME="$ndk"
-                  export ANDROID_NDK_ROOT="$ndk"
-                fi
-              fi
-              if [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" ]]; then
-                export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-              elif [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin" ]]; then
-                export PATH="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-aarch64/bin:$PATH"
-              fi
-              export CC_aarch64_linux_android="''${CC_aarch64_linux_android:-aarch64-linux-android28-clang}"
-              export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
-              export AR_aarch64_linux_android="''${AR_aarch64_linux_android:-llvm-ar}"
-              export CC_x86_64_linux_android="''${CC_x86_64_linux_android:-x86_64-linux-android28-clang}"
-              export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$CC_x86_64_linux_android"
-              export AR_x86_64_linux_android="''${AR_x86_64_linux_android:-llvm-ar}"
-              echo "manager — nix run | just apk-release | nix run .#apk -- --release"
+              echo "manager — nix run | nix develop .#android (APK) | nix run .#apk -- --release"
               echo "  prime-agent: $(command -v prime-agent)"
+            '';
+          };
+
+          # Opt-in Android: SDK/NDK + android rust targets + cargo-apk.
+          android = pkgs.mkShell {
+            packages = android.tools ++ [
+              pkgs.pkg-config
+              pkgs.librsvg
+            ];
+            buildInputs = libs;
+            LD_LIBRARY_PATH = lib.makeLibraryPath libs;
+            ANDROID_HOME = android.sdkRoot;
+            ANDROID_SDK_ROOT = android.sdkRoot;
+            ANDROID_NDK_HOME = "${android.sdkRoot}/ndk-bundle";
+            ANDROID_NDK_ROOT = "${android.sdkRoot}/ndk-bundle";
+            shellHook = ''
+              ${android.env}
+              echo "manager android — just apk-release | nix run .#apk -- --release"
               echo "  ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
             '';
           };

@@ -19,7 +19,7 @@ nix run .#package-desktop  # pure package via its .desktop
 
 `apps.default` / `apps.desktop` cargo-build, install `manager.desktop` + hicolor icons into **`$XDG_DATA_HOME`** (`~/.local/share` by default — required on Wayland/GNOME; a private share dir is invisible to the shell), refresh icon/desktop caches, then `gtk-launch manager`. The binary also embeds the PNG via `vidya::with_app_icon_id` (used on X11; Wayland window icons come from the FreeDesktop entry). Incremental builds go into `./target/`.
 
-Optional interactive shell:
+Optional interactive shell (desktop toolchain; use `nix develop .#android` for APK work):
 
 ```bash
 nix develop
@@ -46,13 +46,13 @@ The left **Agents** sidebar groups sessions by workspace (folder name; hover for
 Shell package (`uk.nandi.manager`) for phone / Waydroid install smoke tests. Full prime-agent PTY sessions stay on the desktop build (egui_term needs a Unix PTY).
 
 ```bash
-nix develop
+nix develop .#android     # opt-in: SDK/NDK + android rust targets (large)
 just apk-release          # aarch64 release → android/target/release/apk/manager.apk
 just apk-release-x86      # x86_64 (Waydroid)
 nix run .#apk -- --release --target aarch64-linux-android
 ```
 
-`nix develop` / `nix run .#apk` provide a hermetic Android SDK+NDK, `cargo-apk`, JDK (`keytool`), and a rust-overlay toolchain with `aarch64-linux-android` / `x86_64-linux-android` targets. Override `ANDROID_HOME` / `ANDROID_NDK_HOME` if you prefer a host install.
+`nix develop .#android` / `nix run .#apk` provide a hermetic Android SDK+NDK, `cargo-apk`, JDK (`keytool`), and a rust-overlay toolchain with `aarch64-linux-android` / `x86_64-linux-android` targets. The default `nix develop` / `nix run` stay desktop-only (host Rust + GUI libs) so they do not pull the multi‑GB Android closure. Override `ANDROID_HOME` / `ANDROID_NDK_HOME` if you prefer a host install.
 
 ## Requirements
 
@@ -89,15 +89,16 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `apps.default` / `apps.desktop` | Devshell: cargo build + `gtk-launch` `.desktop` (icon) |
 | `apps.manager` | Devshell: cargo build + run binary only |
 | `apps.build` | Devshell: `cargo build --release` only |
-| `apps.apk` | Hermetic cargo-apk build (`--release`, `--target`, …) |
+| `apps.apk` | Hermetic cargo-apk build (`--release`, `--target`, …) — Android closure |
 | `apps.prime-agent` | Run the packaged Prime Agent CLI |
 | `apps.package` | Pure store binary |
 | `apps.package-desktop` | Pure package via its `.desktop` |
 | `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes prime-agent + clipboard tools) |
 | `packages.desktop` | Wrapper that launches the packaged `.desktop` |
 | `packages.prime-agent` | Prime Agent CLI (from [codegod100/agentic](https://github.com/codegod100/agentic)) |
-| `packages.android-sdk` | Hermetic Android SDK+NDK used by APK builds |
-| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + prime-agent + clipboard |
+| `packages.android-sdk` | Hermetic Android SDK+NDK (opt-in; not on desktop package closure) |
+| `devShells.default` | Host rust (minimal+clippy/rustfmt) + egui libs + prime-agent + clipboard |
+| `devShells.android` | Android rust targets + cargo-apk + hermetic SDK/NDK |
 | `assets/manager.svg` | App icon source |
 
 Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds. Binary cache: `codegod100.cachix.org` (configured via `nixConfig`).
