@@ -25,6 +25,26 @@ apk-release:
 apk-release-x86:
     ./scripts/build-apk.sh --release --target x86_64-linux-android
 
+# docker-android emulator on desktop (VNC http://localhost:6080, adb localhost:5555)
+docker-android:
+    ./scripts/docker-android.sh start
+
+docker-android-wait:
+    ./scripts/docker-android.sh wait
+
+docker-android-stop:
+    ./scripts/docker-android.sh stop
+
+docker-android-status:
+    ./scripts/docker-android.sh status
+
+# Build x86 debug APK, install, and launch on docker-android
+docker-android-smoke:
+    ./scripts/docker-android.sh start
+    ./scripts/docker-android.sh wait
+    APK="$(./scripts/build-apk.sh --target x86_64-linux-android)"
+    ./scripts/android-smoke.sh "$APK"
+
 # Install + launch on adb device (docker-android: adb connect localhost:5555)
 android-smoke apk:
     ./scripts/android-smoke.sh {{apk}}

@@ -54,6 +54,22 @@ just apk-release-x86      # x86_64 (Waydroid)
 
 Needs Android NDK (`ANDROID_NDK_HOME`, default `~/.local/share/android-ndk-r29`), `cargo-apk`, and `rustup target add aarch64-linux-android` (and/or `x86_64-linux-android`).
 
+**Desktop emulator (docker-android)** — x86_64 APK + browser VNC (no phone / Waydroid required):
+
+```bash
+# Docker + KVM on Linux (or WSL2 with nested virt — see budtmo/docker-android README)
+just docker-android              # start → http://localhost:6080
+just docker-android-wait         # optional: wait for boot (needs adb)
+just docker-android-smoke        # start, build debug x86 APK, install + launch
+
+# Or step by step:
+just apk-release-x86
+just android-smoke android/target/release/apk/manager.apk
+just docker-android-stop
+```
+
+`adb` from `android-tools-adb` / platform-tools; connect with `adb connect localhost:5555`.
+
 ## Requirements
 
 - Rust toolchain
