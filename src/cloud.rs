@@ -5,6 +5,7 @@
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const API_BASE: &str = "https://api.cursor.com";
 
@@ -134,7 +135,7 @@ impl CloudWatch {
 /// Resolve API key from `CURSOR_API_KEY`.
 pub fn resolve_api_key() -> Result<String, String> {
     let key = std::env::var("CURSOR_API_KEY").map_err(|_| {
-        "CURSOR_API_KEY is not set (create one at cursor.com/dashboard/api)".to_string()
+        "CURSOR_API_KEY is not set (use Sign in or cursor.com/dashboard/api)".to_string()
     })?;
     let key = key.trim().to_string();
     if key.is_empty() {
@@ -257,49 +258,49 @@ pub fn workspace_for_repo(repo_url: &str) -> PathBuf {
 }
 
 fn api_get(api_key: &str, url: &str) -> Result<Value, String> {
-    let response = ureq::get(url)
-        .set("Authorization", &basic_auth(api_key))
-        .set("Accept", "application/json")
-        .call()
-        .map_err(|e| format_http_error("GET", url, e))?;
+    let client = http_client()?;
+    let response = client
+        .get(url)
+        .basic_auth(api_key, Some(""))
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| format!("GET {url} failed: {e}"))?;
     parse_json_response(response)
 }
 
 fn api_post(api_key: &str, url: &str, body: &Value) -> Result<Value, String> {
-    let response = ureq::post(url)
-        .set("Authorization", &basic_auth(api_key))
-        .set("Accept", "application/json")
-        .set("Content-Type", "application/json")
-        .send_json(body)
-        .map_err(|e| format_http_error("POST", url, e))?;
+    let client = http_client()?;
+    let response = client
+        .post(url)
+        .basic_auth(api_key, Some(""))
+        .header("Accept", "application/json")
+        .json(body)
+        .send()
+        .map_err(|e| format!("POST {url} failed: {e}"))?;
     parse_json_response(response)
 }
 
-fn parse_json_response(response: ureq::Response) -> Result<Value, String> {
+fn http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client setup failed: {e}"))
+}
+
+fn parse_json_response(response: reqwest::blocking::Response) -> Result<Value, String> {
     let status = response.status();
     let text = response
-        .into_string()
+        .text()
         .map_err(|e| format!("read response body: {e}"))?;
-    if !(200..300).contains(&status) {
+    if !status.is_success() {
         let detail = extract_error_message(&text).unwrap_or_else(|| text.trim().to_string());
         return Err(if detail.is_empty() {
-            format!("HTTP {status}")
+            format!("HTTP {}", status.as_u16())
         } else {
-            format!("HTTP {status}: {detail}")
+            format!("HTTP {}: {detail}", status.as_u16())
         });
     }
     serde_json::from_str(&text).map_err(|e| format!("invalid JSON: {e}"))
-}
-
-fn format_http_error(method: &str, url: &str, err: ureq::Error) -> String {
-    match err {
-        ureq::Error::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            let detail = extract_error_message(&body).unwrap_or(body);
-            format!("{method} {url} failed ({code}): {}", detail.trim())
-        }
-        other => format!("{method} {url} failed: {other}"),
-    }
 }
 
 fn extract_error_message(body: &str) -> Option<String> {
@@ -311,35 +312,6 @@ fn extract_error_message(body: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-}
-
-fn basic_auth(api_key: &str) -> String {
-    format!("Basic {}", base64_encode(&format!("{api_key}:")))
-}
-
-fn base64_encode(input: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 63) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            TABLE[((triple >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            TABLE[(triple & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 fn parse_agent_summary(value: &Value) -> Option<CloudAgentSummary> {
@@ -516,10 +488,5 @@ mod tests {
             normalize_repo_url("github.com/org/repo").unwrap(),
             "https://github.com/org/repo"
         );
-    }
-
-    #[test]
-    fn base64_roundtrip_basic_auth() {
-        assert_eq!(base64_encode("abc"), "YWJj");
     }
 }

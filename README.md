@@ -62,6 +62,24 @@ Needs Android NDK (`ANDROID_NDK_HOME`, default `~/.local/share/android-ndk-r29`)
 - Linux (Wayland or X11)
 - `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste
 
+### Cursor API key (OIDC)
+
+Agent Manager can load `CURSOR_API_KEY` for spawned `cursor-agent` PTY children via OpenBao:
+
+1. **Utils → Cursor sign-in (OIDC)** (or the header **Cursor: sign in** button)
+2. OIDC login to your OpenBao server (default `https://openbao.boxd.sh`, mount `oidc`)
+3. Read `CURSOR_API_KEY` from KV `secret/data/ai-api-keys`
+
+On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is exported for child processes. On next launch, a stored token is restored automatically when `CURSOR_API_KEY` is not already set.
+
+| Variable | Purpose |
+|----------|---------|
+| `BAO_ADDR` / `VAULT_ADDR` | OpenBao server (default `https://openbao.boxd.sh`) |
+| `BAO_TOKEN` / `VAULT_TOKEN` | Skip OIDC and use a token directly |
+| `BAO_OIDC_MOUNT` / `BAO_OIDC_ROLE` | OIDC auth mount and role |
+| `MANAGER_OIDC_PORT` | Local callback port (default `8251`) |
+| `CURSOR_API_KEY` | If already set, OIDC sign-in is optional |
+
 ## Nix
 
 | Output | Role |
