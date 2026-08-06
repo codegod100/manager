@@ -1,4 +1,4 @@
-//! OpenBao OIDC → Cursor API key for `cursor-agent` child processes.
+//! OpenBao OIDC → Cursor API key for Cloud Agents API (watch-only tabs).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -196,7 +196,7 @@ pub fn has_cursor_api_key() -> bool {
         .unwrap_or(false)
 }
 
-/// Export `CURSOR_API_KEY` for child `cursor-agent` processes.
+/// Export `CURSOR_API_KEY` for Cloud Agents API calls.
 pub fn apply_cursor_api_key(key: &str) {
     let key = key.trim();
     if !key.is_empty() {

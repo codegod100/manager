@@ -1,6 +1,6 @@
 # Agent Manager
 
-Desktop GUI for running multiple interactive [`cursor-agent`](https://cursor.com) sessions. Themed with [vidya](https://tangled.org/nandi.uk/vidya) (egui), terminals via [`egui_term`](https://crates.io/crates/egui_term) (alacritty PTY).
+Desktop GUI for running multiple interactive [`prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent) sessions. Themed with [vidya](https://tangled.org/nandi.uk/vidya) (egui), terminals via [`egui_term`](https://crates.io/crates/egui_term) (alacritty PTY).
 
 ![Agent Manager](assets/screenshot.png)
 
@@ -35,15 +35,15 @@ nix build .#manager
 #       result/share/icons/hicolor/.../apps/manager.{svg,png}
 ```
 
-**New session** opens a dialog for workspace, optional model / prompt, and `--trust` / `--force`. It runs `cursor-agent create-chat`, then spawns the PTY with `--resume <chatId>` so the session is bound to Cursor’s chat store. **Resume** lists past chats from `~/.cursor/chats` and spawns with `--resume <chatId>`. **Cloud** lists and launches [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) via the API (`CURSOR_API_KEY` from [cursor.com/dashboard/api](https://cursor.com/dashboard/api)) — watch-only tabs poll agent status and open `cursor.com/agents/<bc-id>` in the browser (no local PTY).
+**New session** opens a dialog for workspace, optional model / prompt. It spawns an interactive `prime-agent` PTY with `--cwd <workspace>` (and optional `--model` / initial prompt). **Resume** lists past sessions from `~/.prime/agent/sessions` and spawns with `--resume <sessionId>`. **Cloud** still lists and launches [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent) via the API (`CURSOR_API_KEY` from [cursor.com/dashboard/api](https://cursor.com/dashboard/api)) — watch-only tabs poll agent status and open `cursor.com/agents/<bc-id>` in the browser (no local PTY).
 
-The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests Tasks under each session (from `agent-transcripts/<chatId>/`, `subagents/`, and Task records in the chat store). Cloud agents show a ☁ marker. Click a session to focus its terminal; cloud tabs show a status panel instead. Click a Task to open its nested chat (`isSubagent`) in a new tab when Cursor created one, or focus the parent if not. Right-click a session for rename. **Close** removes the active session.
+The left **Agents** sidebar groups sessions by workspace (folder name; hover for full path), shows status + title, and nests RLM child sessions under each parent (from `parentSession` links in session JSONL). Cloud agents show a ☁ marker. Click a session to focus its terminal; cloud tabs show a status panel instead. Click a child to open it with `--resume` in a new tab when it has its own session file. Right-click a session for rename. **Close** removes the active session.
 
-**Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to cursor-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager types `@/path.png` into the TUI composer (so the agent attaches it synchronously), then types the initial prompt and submits. `--image` is headless-only, so interactive sessions cannot rely on it.
+**Paste images** with Ctrl+V in an active session (screenshot / image on the clipboard). The manager forwards `^V` to prime-agent, which attaches the image via `wl-paste` / `xclip`. In the **New session** dialog, Ctrl+V saves a clipboard image to a temp file; after spawn the manager pastes into the TUI composer, then types the initial prompt and submits.
 
 ## Android APK
 
-Shell package (`uk.nandi.manager`) for phone / Waydroid install smoke tests. Full cursor-agent PTY sessions stay on the desktop build (egui_term needs a Unix PTY).
+Shell package (`uk.nandi.manager`) for phone / Waydroid install smoke tests. Full prime-agent PTY sessions stay on the desktop build (egui_term needs a Unix PTY).
 
 ```bash
 nix develop
@@ -57,20 +57,26 @@ nix run .#apk -- --release --target aarch64-linux-android
 ## Requirements
 
 - Rust toolchain (provided by `nix develop`)
-- `cursor-agent` on `PATH` (flake wraps it in; or set `CURSOR_AGENT` to an executable path; Cursor’s in-session `CURSOR_AGENT=1` flag is ignored)
-- `CURSOR_API_KEY` for **Cloud** (API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api))
+- [`prime-agent`](https://github.com/PrimeIntellect-ai/prime-agent) on `PATH` (or set `PRIME_AGENT` to an executable path)
+- `CURSOR_API_KEY` for **Cloud** only (API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api))
 - Linux (Wayland or X11)
 - `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste (also in the flake)
 
-### Cursor API key (OIDC)
+Install prime-agent (example):
 
-Agent Manager can load `CURSOR_API_KEY` for spawned `cursor-agent` PTY children via OpenBao:
+```bash
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+```
+
+### Cursor API key (OIDC) — Cloud tabs
+
+Agent Manager can load `CURSOR_API_KEY` for the Cursor Cloud Agents API via OpenBao:
 
 1. **Utils → Cursor sign-in (OIDC)** (or the header **Cursor: sign in** button)
 2. OIDC login to your OpenBao server (default `https://openbao.boxd.sh`, mount `oidc`)
 3. Read `CURSOR_API_KEY` from KV `secret/data/ai-api-keys`
 
-On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is exported for child processes. On next launch, a stored token is restored automatically when `CURSOR_API_KEY` is not already set.
+On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is exported. On next launch, a stored token is restored automatically when `CURSOR_API_KEY` is not already set. Local `prime-agent` PTYs use Prime Agent’s own `/login` / provider credentials, not this key.
 
 | Variable | Purpose |
 |----------|---------|
@@ -78,7 +84,9 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `BAO_TOKEN` / `VAULT_TOKEN` | Skip OIDC and use a token directly |
 | `BAO_OIDC_MOUNT` / `BAO_OIDC_ROLE` | OIDC auth mount and role |
 | `MANAGER_OIDC_PORT` | Local callback port (default `8251`) |
-| `CURSOR_API_KEY` | If already set, OIDC sign-in is optional |
+| `CURSOR_API_KEY` | If already set, OIDC sign-in is optional (Cloud only) |
+| `PRIME_AGENT` | Optional path override for the prime-agent binary |
+| `PRIME_AGENT_SESSION_DIR` | Optional override for session storage (default `~/.prime/agent/sessions`) |
 
 ## Nix
 
@@ -88,17 +96,15 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `apps.manager` | Devshell: cargo build + run binary only |
 | `apps.build` | Devshell: `cargo build --release` only |
 | `apps.apk` | Hermetic cargo-apk build (`--release`, `--target`, …) |
-| `apps.cursor-agent` | Run the packaged Cursor agent CLI |
 | `apps.package` | Pure store binary |
 | `apps.package-desktop` | Pure package via its `.desktop` |
-| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes cursor-agent + clipboard tools) |
+| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes clipboard tools) |
 | `packages.desktop` | Wrapper that launches the packaged `.desktop` |
-| `packages.cursor-agent` | Cursor agent CLI (from [nix-ai-tools](https://github.com/numtide/nix-ai-tools)) |
 | `packages.android-sdk` | Hermetic Android SDK+NDK used by APK builds |
-| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + cursor-agent + clipboard |
+| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + clipboard |
 | `assets/manager.svg` | App icon source |
 
-Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds.
+Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds. Install `prime-agent` on the host (not packaged by this flake).
 
 ## Notes
 

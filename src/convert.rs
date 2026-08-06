@@ -1,11 +1,11 @@
-//! Bash → Nushell conversion via cursor-agent (`--print --mode ask`).
+//! Bash → Nushell conversion via prime-agent (`--print`).
 
 use crate::session::resolve_agent_binary;
 use std::process::Command;
 
-/// Convert a bash script/snippet to idiomatic Nushell using cursor-agent ask mode.
+/// Convert a bash script/snippet to idiomatic Nushell using prime-agent print mode.
 ///
-/// Safe to run off the UI thread. Uses `--print --mode ask` (read-only; no edits).
+/// Safe to run off the UI thread. Uses `--print` (non-interactive; exits after reply).
 pub fn bash_to_nushell(bash: &str) -> Result<String, String> {
     let bash = bash.trim();
     if bash.is_empty() {
@@ -25,17 +25,9 @@ pub fn bash_to_nushell(bash: &str) -> Result<String, String> {
     );
 
     let output = Command::new(&agent)
-        .args([
-            "--print",
-            "--mode",
-            "ask",
-            "--output-format",
-            "text",
-            "--trust",
-            &prompt,
-        ])
+        .args(["--print", "--no-session", "--offline", &prompt])
         .output()
-        .map_err(|e| format!("failed to run cursor-agent: {e}"))?;
+        .map_err(|e| format!("failed to run prime-agent: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -46,7 +38,7 @@ pub fn bash_to_nushell(bash: &str) -> Result<String, String> {
             stdout.trim().to_string()
         };
         return Err(format!(
-            "cursor-agent convert failed ({}): {}",
+            "prime-agent convert failed ({}): {}",
             output.status,
             if detail.is_empty() {
                 "no output"
@@ -59,7 +51,7 @@ pub fn bash_to_nushell(bash: &str) -> Result<String, String> {
     let raw = String::from_utf8_lossy(&output.stdout);
     let cleaned = strip_code_fence(raw.trim());
     if cleaned.is_empty() {
-        return Err("cursor-agent returned empty Nushell".into());
+        return Err("prime-agent returned empty Nushell".into());
     }
     Ok(cleaned)
 }

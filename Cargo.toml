@@ -2,7 +2,7 @@
 name = "manager"
 version = "0.1.0"
 edition = "2021"
-description = "Multi-instance cursor-agent manager (vidya + egui_term)"
+description = "Multi-instance prime-agent manager (vidya + egui_term)"
 license = "MIT"
 publish = false
 

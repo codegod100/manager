@@ -1,5 +1,5 @@
 # Agent Manager
-#   nix develop                 # SDK/NDK + cargo-apk + cursor-agent
+#   nix develop                 # SDK/NDK + cargo-apk (+ prime-agent on PATH)
 #   just apk-release            # phone aarch64 release APK
 #   just apk-release-x86        # Waydroid x86_64 release APK
 #   nix run .#apk -- --release  # same hermetic toolchain without enter shell

@@ -1,7 +1,7 @@
 //! Agent Manager Android shell (vidya chrome).
 //!
 //! Full multi-agent PTY sessions stay on the desktop build — egui_term needs a
-//! Unix PTY and `cursor-agent` on PATH. This APK ships the branded UI so the
+//! Unix PTY and `prime-agent` on PATH. This APK ships the branded UI so the
 //! package installs and launches on phone / Waydroid.
 
 use eframe::egui::{self, Align, Layout, RichText, ScrollArea};
@@ -71,7 +71,7 @@ impl eframe::App for ManagerShell {
                 ui.add_space(self.theme.spacing.sm);
                 ui.horizontal(|ui| {
                     ui.add_space(self.theme.spacing.md);
-                    dim_label(ui, &self.theme, "Multi-instance cursor-agent");
+                    dim_label(ui, &self.theme, "Multi-instance prime-agent");
                 });
 
                 ui.add_space(self.theme.spacing.lg);
@@ -92,9 +92,9 @@ impl eframe::App for ManagerShell {
                                     body(
                                         ui,
                                         &self.theme,
-                                        "Agent Manager embeds cursor-agent in live PTYs \
+                                        "Agent Manager embeds prime-agent in live PTYs \
                                          (egui_term). That stack needs a Linux desktop with \
-                                         cursor-agent on PATH — not available inside this APK.",
+                                         prime-agent on PATH — not available inside this APK.",
                                     );
                                     ui.add_space(self.theme.spacing.md);
                                     body(
