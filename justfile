@@ -38,7 +38,15 @@ docker-android-stop:
 docker-android-status:
     ./scripts/docker-android.sh status
 
-# Build x86 debug APK, install, and launch on docker-android
+# Full flow on boxd (laptop with boxd auth): boot VM + docker-android + APK smoke
+boxd-docker-android:
+    ./scripts/boxd-launch-docker-android.sh
+
+# On a boxd VM already (SSH): docker-android + build + smoke
+boxd-docker-android-smoke:
+    ./scripts/boxd-docker-android-smoke.sh
+
+# Build x86 debug APK, install, and launch on local docker-android
 docker-android-smoke:
     ./scripts/docker-android.sh start
     ./scripts/docker-android.sh wait

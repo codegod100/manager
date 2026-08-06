@@ -52,10 +52,15 @@ need() {
 
 need_docker() {
   need docker
-  if ! docker info >/dev/null 2>&1; then
-    echo "docker daemon not running (start Docker Desktop or system docker)" >&2
-    exit 1
+  if docker info >/dev/null 2>&1; then
+    return 0
   fi
+  if command -v sudo >/dev/null && sudo docker info >/dev/null 2>&1; then
+    docker() { sudo docker "$@"; }
+    return 0
+  fi
+  echo "docker daemon not running (start Docker Desktop or system docker)" >&2
+  exit 1
 }
 
 warn_kvm() {

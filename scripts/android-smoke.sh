@@ -16,8 +16,14 @@ need() {
 need adb
 
 adb_connect() {
-  adb disconnect "$ADB_SERIAL" >/dev/null 2>&1 || true
-  adb connect "$ADB_SERIAL"
+  # Local adb emulators are already listed; only network devices need connect.
+  if [[ "$ADB_SERIAL" == emulator-* ]]; then
+    return 0
+  fi
+  if [[ "$ADB_SERIAL" == *:* ]]; then
+    adb disconnect "$ADB_SERIAL" >/dev/null 2>&1 || true
+    adb connect "$ADB_SERIAL"
+  fi
 }
 
 wait_booted() {
