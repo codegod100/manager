@@ -3,6 +3,7 @@
 mod app;
 mod auth;
 mod clipboard;
+mod cloud;
 mod convert;
 mod oidc;
 mod session;

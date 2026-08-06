@@ -4,10 +4,11 @@ use crate::auth::{
     complete_oidc_login, cursor_auth_status_label, fetch_cursor_api_key, has_cursor_api_key,
     load_bao_token, resolve_bao_addr, restore_cursor_auth,
 };
+use crate::cloud::{self, CloudAgentSummary, CloudWatch};
 use crate::oidc::{start_oidc_login, OidcLogin, OidcLoginConfig, OidcLoginEvent};
 use crate::session::{
     kill_pid, list_saved_chats, title_case_words, AgentSession, NewSessionDraft, PreparedSession,
-    SavedChat,
+    SavedChat, Session,
 };
 use crate::subagents::{self, ChatSnapshot, SubagentStatus};
 use alacritty_terminal::selection::SelectionType;
@@ -39,6 +40,9 @@ const TERM_SYMBOLS_NAME: &str = "term-symbols";
 /// How often the background chat poller re-reads store/transcripts.
 const CHAT_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
+/// How often the background cloud poller re-reads agent status.
+const CLOUD_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
 /// How long to wait for `PtyEvent::Exit` after killing a child before giving up
 /// and `mem::forget`ing the backend (avoids egui_term's Shutdown busy-spin).
 const PTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -48,6 +52,66 @@ struct DrainingPty {
     id: u64,
     backend: TerminalBackend,
     since: Instant,
+}
+
+struct CloudDialog {
+    filter: String,
+    agents: Vec<CloudAgentSummary>,
+    selected: Option<String>,
+    workspace: String,
+    repo_url: String,
+    model: String,
+    prompt: String,
+    name: String,
+    load_error: Option<String>,
+    action_error: Option<String>,
+    loading: bool,
+    creating: bool,
+    /// True while create-agent runs off-thread.
+    busy: bool,
+}
+
+impl CloudDialog {
+    fn loading(workspace: String, repo_url: String) -> Self {
+        Self {
+            filter: String::new(),
+            agents: Vec::new(),
+            selected: None,
+            workspace,
+            repo_url,
+            model: String::new(),
+            prompt: String::new(),
+            name: String::new(),
+            load_error: None,
+            action_error: None,
+            loading: true,
+            creating: false,
+            busy: false,
+        }
+    }
+
+    fn filtered(&self) -> Vec<&CloudAgentSummary> {
+        let q = self.filter.trim().to_lowercase();
+        self.agents
+            .iter()
+            .filter(|a| {
+                if q.is_empty() {
+                    return true;
+                }
+                a.name.to_lowercase().contains(&q)
+                    || a.id.to_lowercase().contains(&q)
+                    || a.status.to_lowercase().contains(&q)
+                    || a.repo_url
+                        .as_deref()
+                        .is_some_and(|r| r.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
+    fn selected_agent(&self) -> Option<&CloudAgentSummary> {
+        let id = self.selected.as_deref()?;
+        self.agents.iter().find(|a| a.id == id)
+    }
 }
 
 struct ResumeDialog {
@@ -204,10 +268,13 @@ impl ResumeDialog {
 /// Session id + chat id + workspace for the background poller.
 type ChatWatch = (u64, String, PathBuf);
 
+/// Session id + bc id for the background cloud poller.
+type CloudWatchEntry = (u64, String);
+
 pub struct App {
     theme: Theme,
     next_id: u64,
-    sessions: BTreeMap<u64, AgentSession>,
+    sessions: BTreeMap<u64, Session>,
     active: Option<u64>,
     pty_tx: Sender<(u64, PtyEvent)>,
     pty_rx: Receiver<(u64, PtyEvent)>,
@@ -215,8 +282,12 @@ pub struct App {
     chat_watch_tx: Sender<Vec<ChatWatch>>,
     chat_snap_rx: Receiver<(u64, ChatSnapshot)>,
     last_chat_watch: Vec<ChatWatch>,
+    cloud_watch_tx: Sender<Vec<CloudWatchEntry>>,
+    cloud_snap_rx: Receiver<(u64, cloud::CloudAgentDetail, Option<cloud::CloudRunSnapshot>)>,
+    last_cloud_watch: Vec<CloudWatchEntry>,
     new_dialog: Option<NewSessionDraft>,
     resume_dialog: Option<ResumeDialog>,
+    cloud_dialog: Option<CloudDialog>,
     rename_dialog: Option<RenameDialog>,
     convert_dialog: Option<ConvertDialog>,
     spawn_error: Option<String>,
@@ -226,6 +297,8 @@ pub struct App {
     spawn_rx: Receiver<(u64, Result<PreparedSession, String>)>,
     spawn_tx: Sender<(u64, Result<PreparedSession, String>)>,
     resume_load_rx: Option<Receiver<Result<Vec<SavedChat>, String>>>,
+    cloud_load_rx: Option<Receiver<Result<Vec<CloudAgentSummary>, String>>>,
+    cloud_create_rx: Option<Receiver<Result<CloudAgentSummary, String>>>,
     /// Bumped when starting / cancelling a bash→nu convert so stale results drop.
     convert_gen: u64,
     convert_rx: Receiver<(u64, Result<String, String>)>,
@@ -252,13 +325,21 @@ impl App {
         let (pty_tx, pty_rx) = mpsc::channel();
         let (chat_watch_tx, chat_watch_rx) = mpsc::channel::<Vec<ChatWatch>>();
         let (chat_snap_tx, chat_snap_rx) = mpsc::channel::<(u64, ChatSnapshot)>();
+        let (cloud_watch_tx, cloud_watch_rx) = mpsc::channel::<Vec<CloudWatchEntry>>();
+        let (cloud_snap_tx, cloud_snap_rx) =
+            mpsc::channel::<(u64, cloud::CloudAgentDetail, Option<cloud::CloudRunSnapshot>)>();
         let (spawn_tx, spawn_rx) = mpsc::channel();
         let (convert_tx, convert_rx) = mpsc::channel();
         let poll_ctx = cc.egui_ctx.clone();
+        let cloud_poll_ctx = cc.egui_ctx.clone();
         std::thread::Builder::new()
             .name("chat-poller".into())
             .spawn(move || chat_poller_loop(chat_watch_rx, chat_snap_tx, poll_ctx))
             .expect("spawn chat-poller thread");
+        std::thread::Builder::new()
+            .name("cloud-poller".into())
+            .spawn(move || cloud_poller_loop(cloud_watch_rx, cloud_snap_tx, cloud_poll_ctx))
+            .expect("spawn cloud-poller thread");
 
         let mut theme = Theme::dark();
         theme.type_scale.caption = 13.0;
@@ -273,8 +354,12 @@ impl App {
             chat_watch_tx,
             chat_snap_rx,
             last_chat_watch: Vec::new(),
+            cloud_watch_tx,
+            cloud_snap_rx,
+            last_cloud_watch: Vec::new(),
             new_dialog: None,
             resume_dialog: None,
+            cloud_dialog: None,
             rename_dialog: None,
             convert_dialog: None,
             spawn_error: None,
@@ -283,6 +368,8 @@ impl App {
             spawn_rx,
             spawn_tx,
             resume_load_rx: None,
+            cloud_load_rx: None,
+            cloud_create_rx: None,
             convert_gen: 0,
             convert_rx,
             convert_tx,
@@ -303,6 +390,7 @@ impl App {
     fn dialog_open(&self) -> bool {
         self.new_dialog.is_some()
             || self.resume_dialog.is_some()
+            || self.cloud_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.convert_dialog.is_some()
             || self.auth_dialog.is_some()
@@ -463,7 +551,8 @@ impl App {
                 PtyEvent::Exit => {
                     // Subscriber thread has exited; safe to Drop the backend now.
                     self.finish_draining(id);
-                    if let Some(session) = self.sessions.get_mut(&id) {
+                    if let Some(session) = self.sessions.get_mut(&id).and_then(|s| s.as_local_mut())
+                    {
                         session.alive = false;
                         if !session.title.ends_with(" (exited)") {
                             session.title.push_str(" (exited)");
@@ -471,14 +560,16 @@ impl App {
                     }
                 }
                 PtyEvent::Title(title) => {
-                    if let Some(session) = self.sessions.get_mut(&id) {
+                    if let Some(session) = self.sessions.get_mut(&id).and_then(|s| s.as_local_mut())
+                    {
                         if session.alive && !session.title_locked {
                             session.title = title;
                         }
                     }
                 }
                 PtyEvent::Wakeup => {
-                    if let Some(session) = self.sessions.get_mut(&id) {
+                    if let Some(session) = self.sessions.get_mut(&id).and_then(|s| s.as_local_mut())
+                    {
                         if session.alive {
                             session.bump_activity();
                         }
@@ -514,20 +605,47 @@ impl App {
     /// Non-blocking: publish watches + apply snapshots from the poller thread.
     fn poll_subagents(&mut self, ctx: &egui::Context) {
         while let Ok((id, snap)) = self.chat_snap_rx.try_recv() {
-            if let Some(session) = self.sessions.get_mut(&id) {
+            if let Some(session) = self.sessions.get_mut(&id).and_then(|s| s.as_local_mut()) {
                 let _ = session.apply_chat_snapshot(snap);
+            }
+        }
+
+        while let Ok((id, detail, run)) = self.cloud_snap_rx.try_recv() {
+            if let Some(session) = self.sessions.get_mut(&id).and_then(|s| s.as_cloud_mut()) {
+                session.apply_poll(&detail, run.as_ref());
             }
         }
 
         let watches: Vec<ChatWatch> = self
             .sessions
             .iter()
-            .filter(|(_, s)| !s.chat_id.is_empty())
-            .map(|(id, s)| (*id, s.chat_id.clone(), s.workspace.clone()))
+            .filter_map(|(id, s)| {
+                if s.is_cloud() || s.chat_id().is_empty() {
+                    None
+                } else {
+                    Some((*id, s.chat_id().to_string(), s.workspace().to_path_buf()))
+                }
+            })
             .collect();
         if watches != self.last_chat_watch {
             let _ = self.chat_watch_tx.send(watches.clone());
             self.last_chat_watch = watches;
+        }
+
+        let cloud_watches: Vec<CloudWatchEntry> = self
+            .sessions
+            .iter()
+            .filter_map(|(id, s)| {
+                if s.is_cloud() {
+                    Some((*id, s.chat_id().to_string()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if cloud_watches != self.last_cloud_watch {
+            let _ = self.cloud_watch_tx.send(cloud_watches.clone());
+            self.last_cloud_watch = cloud_watches;
         }
 
         if !self.sessions.is_empty() {
@@ -691,7 +809,7 @@ impl App {
                         prepared,
                     ) {
                         Ok(session) => {
-                            self.sessions.insert(id, session);
+                            self.sessions.insert(id, Session::Local(session));
                             self.active = Some(id);
                             self.new_dialog = None;
                             self.resume_dialog = None;
@@ -717,7 +835,7 @@ impl App {
     /// Push deferred new-session images/prompt into live agent composers.
     fn progress_composer_seeds(&mut self, ctx: &egui::Context) {
         let mut soonest: Option<Duration> = None;
-        for session in self.sessions.values_mut() {
+        for session in self.sessions.values_mut().filter_map(|s| s.as_local_mut()) {
             if let Some(wait) = session.progress_composer_seed() {
                 soonest = Some(match soonest {
                     Some(prev) => prev.min(wait),
@@ -740,19 +858,21 @@ impl App {
 
     fn close_session(&mut self, id: u64) {
         if let Some(session) = self.sessions.remove(&id) {
-            if session.alive {
-                // Kill child first so alacritty emits Exit and egui_term's
-                // subscriber breaks cleanly; only then Drop the backend.
-                if let Some(pid) = session.child_pid {
-                    kill_pid(pid);
+            if let Session::Local(local) = session {
+                if local.alive {
+                    // Kill child first so alacritty emits Exit and egui_term's
+                    // subscriber breaks cleanly; only then Drop the backend.
+                    if let Some(pid) = local.child_pid {
+                        kill_pid(pid);
+                    }
+                    self.draining.push(DrainingPty {
+                        id,
+                        backend: local.backend,
+                        since: Instant::now(),
+                    });
                 }
-                self.draining.push(DrainingPty {
-                    id,
-                    backend: session.backend,
-                    since: Instant::now(),
-                });
             }
-            // Already dead: subscriber already exited on Exit; Drop is safe.
+            // Cloud sessions and already-dead locals: nothing to drain.
         }
         if self.active == Some(id) {
             self.active = self
@@ -768,11 +888,13 @@ impl App {
     fn shutdown_all_sessions(&mut self) {
         let sessions = std::mem::take(&mut self.sessions);
         for (_, session) in sessions {
-            if let Some(pid) = session.child_pid {
-                kill_pid(pid);
+            if let Session::Local(local) = session {
+                if let Some(pid) = local.child_pid {
+                    kill_pid(pid);
+                }
+                // Forget backends: process is exiting; don't Drop → Shutdown race.
+                std::mem::forget(local.backend);
             }
-            // Forget backends: process is exiting; don't Drop → Shutdown race.
-            std::mem::forget(session.backend);
         }
         for drained in self.draining.drain(..) {
             std::mem::forget(drained.backend);
@@ -780,6 +902,8 @@ impl App {
         self.active = None;
         let _ = self.chat_watch_tx.send(Vec::new());
         self.last_chat_watch.clear();
+        let _ = self.cloud_watch_tx.send(Vec::new());
+        self.last_cloud_watch.clear();
         self.cancel_pending_spawn();
     }
 
@@ -794,7 +918,7 @@ impl App {
         if let Some((id, _)) = self
             .sessions
             .iter()
-            .find(|(_, s)| s.chat_id == chat_id)
+            .find(|(_, s)| s.chat_id() == chat_id)
         {
             self.active = Some(*id);
             return;
@@ -817,14 +941,19 @@ impl App {
 
     fn show_header(&mut self, ctx: &egui::Context) {
         let theme = self.theme.clone();
-        let running = self.sessions.values().filter(|s| s.alive).count();
+        let running = self.sessions.values().filter(|s| s.alive()).count();
         let total = self.sessions.len();
-        let active_ws = self
-            .active
-            .and_then(|id| self.sessions.get(&id))
-            .map(|s| format!("#{} · {}", s.id, s.workspace.display()));
+        let active_ws = self.active.and_then(|id| self.sessions.get(&id)).map(|s| {
+            format!(
+                "#{} · {}{}",
+                s.id(),
+                if s.is_cloud() { "☁ " } else { "" },
+                s.workspace().display()
+            )
+        });
         let mut open_new = false;
         let mut open_resume = false;
+        let mut open_cloud = false;
         let mut open_convert = false;
         let mut open_auth = false;
         let busy = self.pending_spawn.is_some();
@@ -839,6 +968,12 @@ impl App {
                     vidya::dim_label(ui, &theme, ws);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if vidya::button(ui, &theme, "Cloud").clicked() {
+                            open_cloud = true;
+                        }
+                    });
+                    ui.add_space(theme.spacing.sm);
                     ui.add_enabled_ui(!busy, |ui| {
                         if vidya::button(ui, &theme, "Resume").clicked() {
                             open_resume = true;
@@ -883,7 +1018,7 @@ impl App {
             if let Some(ws) = self
                 .active
                 .and_then(|id| self.sessions.get(&id))
-                .map(|s| s.workspace.display().to_string())
+                .map(|s| s.workspace().display().to_string())
             {
                 draft.workspace = ws;
             }
@@ -896,9 +1031,30 @@ impl App {
         if open_resume {
             self.resume_dialog = Some(ResumeDialog::loading());
             self.new_dialog = None;
+            self.cloud_dialog = None;
             self.convert_dialog = None;
             self.spawn_error = None;
             self.start_resume_load(ctx);
+        }
+        if open_cloud {
+            let workspace = self
+                .active
+                .and_then(|id| self.sessions.get(&id))
+                .map(|s| s.workspace().display().to_string())
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.display().to_string())
+                })
+                .unwrap_or_else(|| ".".into());
+            let repo_url = cloud::git_remote_url(Path::new(&workspace)).unwrap_or_default();
+            self.cloud_dialog = Some(CloudDialog::loading(workspace, repo_url));
+            self.new_dialog = None;
+            self.resume_dialog = None;
+            self.resume_load_rx = None;
+            self.convert_dialog = None;
+            self.spawn_error = None;
+            self.start_cloud_load(ctx);
         }
         if open_convert {
             self.convert_dialog = Some(ConvertDialog::default());
@@ -918,7 +1074,7 @@ impl App {
         let mut by_workspace: BTreeMap<PathBuf, Vec<u64>> = BTreeMap::new();
         for (id, session) in &self.sessions {
             by_workspace
-                .entry(session.workspace.clone())
+                .entry(session.workspace().to_path_buf())
                 .or_default()
                 .push(*id);
         }
@@ -946,7 +1102,7 @@ impl App {
                 if groups.is_empty() {
                     vidya::dim_label(ui, &theme, "No sessions yet.");
                     ui.add_space(theme.spacing.xs);
-                    vidya::dim_label(ui, &theme, "New session or Resume to start.");
+                    vidya::dim_label(ui, &theme, "New session, Cloud, or Resume to start.");
                     return;
                 }
 
@@ -998,35 +1154,35 @@ impl App {
                                 };
                                 let active = self.active == Some(id);
                                 let running_tasks = session
-                                    .subagents
+                                    .subagents()
                                     .iter()
                                     .filter(|s| s.status.is_live())
                                     .count();
                                 let failed_tasks = session
-                                    .subagents
+                                    .subagents()
                                     .iter()
                                     .filter(|s| s.status == SubagentStatus::Failed)
                                     .count();
                                 let done_tasks = session
-                                    .subagents
+                                    .subagents()
                                     .iter()
                                     .filter(|s| s.status == SubagentStatus::Done)
                                     .count();
-                                let tasks_folded = session.tasks_folded;
-                                let task_note = if session.subagents.is_empty() {
+                                let tasks_folded = session.tasks_folded();
+                                let task_note = if session.subagents().is_empty() {
                                     None
                                 } else {
                                     let chevron = if tasks_folded { "▶" } else { "▼" };
                                     let highlight = session
-                                        .subagents
+                                        .subagents()
                                         .iter()
                                         .find(|s| s.status.is_live())
                                         .or_else(|| {
-                                            session.subagents.iter().find(|s| {
+                                            session.subagents().iter().find(|s| {
                                                 s.status == SubagentStatus::Failed
                                             })
                                         })
-                                        .or_else(|| session.subagents.first())
+                                        .or_else(|| session.subagents().first())
                                         .map(|s| s.title.as_str());
                                     let body = task_header_label(
                                         running_tasks,
@@ -1110,8 +1266,7 @@ impl App {
                                                                 // eats the row and hides `?`.
                                                                 if session.needs_input() {
                                                                     let tip = session
-                                                                        .activity
-                                                                        .as_deref()
+                                                                        .activity()
                                                                         .unwrap_or(
                                                                             "Waiting for answer",
                                                                         );
@@ -1153,13 +1308,12 @@ impl App {
                                                                     )
                                                                     .on_hover_text(
                                                                         session
-                                                                            .activity
-                                                                            .as_deref()
+                                                                            .activity()
                                                                             .unwrap_or(
                                                                                 "Working…",
                                                                             ),
                                                                     );
-                                                                } else if !session.alive {
+                                                                } else if !session.alive() {
                                                                     vidya::status_dot(
                                                                         ui, &theme, false,
                                                                     )
@@ -1169,10 +1323,23 @@ impl App {
                                                                 // default selectable labels
                                                                 // take click sense and steal
                                                                 // selection from the parent.
+                                                                if session.is_cloud() {
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            egui::RichText::new("☁")
+                                                                                .size(
+                                                                                    theme.type_scale.body,
+                                                                                )
+                                                                                .color(dim_color),
+                                                                        )
+                                                                        .selectable(false),
+                                                                    )
+                                                                    .on_hover_text("Cloud agent");
+                                                                }
                                                                 ui.add(
                                                                     egui::Label::new(
                                                                         egui::RichText::new(
-                                                                            &session.title,
+                                                                            session.title(),
                                                                         )
                                                                         .size(
                                                                             theme.type_scale.body,
@@ -1204,7 +1371,9 @@ impl App {
                                         select = Some(id);
                                     }
                                     response.context_menu(|ui| {
-                                        if ui.button("Auto-rename from content").clicked() {
+                                        if !session.is_cloud()
+                                            && ui.button("Auto-rename from content").clicked()
+                                        {
                                             auto_rename = Some(id);
                                             ui.close_menu();
                                         }
@@ -1220,8 +1389,8 @@ impl App {
 
                                     // Nested Task rows — click opens the subagent chat when
                                     // Cursor created a resumable `isSubagent` session.
-                                    let tasks: Vec<_> = session.subagents.clone();
-                                    let parent_workspace = session.workspace.clone();
+                                    let tasks: Vec<_> = session.subagents().to_vec();
+                                    let parent_workspace = session.workspace().to_path_buf();
                                     if let Some(note) = &task_note {
                                         let fold = egui::Frame::NONE
                                             .inner_margin(egui::Margin {
@@ -1364,7 +1533,7 @@ impl App {
         }
         if let Some(id) = toggle_tasks_fold {
             if let Some(session) = self.sessions.get_mut(&id) {
-                session.tasks_folded = !session.tasks_folded;
+                session.toggle_tasks_folded();
             }
         }
         if let Some(workspace) = toggle_workspace_fold {
@@ -1382,7 +1551,7 @@ impl App {
         }
         if let Some(id) = open_rename {
             if let Some(session) = self.sessions.get(&id) {
-                let mut draft = session.title.clone();
+                let mut draft = session.title().to_string();
                 if let Some(base) = draft.strip_suffix(" (exited)") {
                     draft = base.to_string();
                 }
@@ -1965,9 +2134,16 @@ impl App {
             .show(ctx, |ui| {
                 if let Some(id) = active {
                     if let Some(session) = self.sessions.get_mut(&id) {
-                        // CentralPanel is already top-down — don't wrap in ui.vertical /
-                        // ui.horizontal (those can shrink-wrap and collapse the PTY).
                         show_summary_panel(ui, &theme, session);
+
+                        if session.is_cloud() {
+                            show_cloud_panel(ui, &theme, session);
+                            return;
+                        }
+
+                        let Some(local) = session.as_local_mut() else {
+                            return;
+                        };
 
                         let scroll = ui.spacing().scroll;
                         let gap = ui.spacing().item_spacing.x;
@@ -1983,55 +2159,45 @@ impl App {
                             avail,
                             egui::Layout::left_to_right(egui::Align::Min),
                             |ui| {
-                                // Drive selection ourselves before TerminalView paints.
-                                // egui_term skips SelectStart when the PTY has MOUSE_MODE
-                                // (Ink/cursor-agent), so drag-select would otherwise no-op.
                                 let term_origin = ui.cursor().min;
                                 let term_rect =
                                     egui::Rect::from_min_size(term_origin, term_size);
-                                drive_term_selection(ui, session, term_rect);
+                                drive_term_selection(ui, local, term_rect);
 
-                                // PageUp/Down scroll scrollback (egui_term only
-                                // forwards those keys as CSI to the PTY).
-                                let alt_screen = session
+                                let alt_screen = local
                                     .backend
                                     .last_content()
                                     .terminal_mode
                                     .contains(TerminalMode::ALT_SCREEN);
-                                if session.alive && term_focus {
+                                if local.alive && term_focus {
                                     handle_term_page_scroll(
                                         ui,
-                                        &mut session.backend,
+                                        &mut local.backend,
                                         alt_screen,
                                     );
                                 }
 
                                 let mut terminal =
-                                    TerminalView::new(ui, &mut session.backend)
-                                        .set_focus(session.alive && term_focus)
+                                    TerminalView::new(ui, &mut local.backend)
+                                        .set_focus(local.alive && term_focus)
                                         .set_font(term_font.clone())
                                         .set_theme(term_theme.clone())
                                         .set_size(term_size);
-                                // Don't also send PageUp/Down to the PTY while
-                                // we own them for scrollback (primary screen).
                                 if !alt_screen {
                                     terminal = terminal
                                         .add_bindings(term_page_scroll_bindings());
                                 }
                                 let term_response = ui.add(terminal);
-                                auto_copy_term_selection(ui, session, &term_response);
-                                // egui_term ignores CSI ? 25 l and always paints the
-                                // grid cursor. cursor-agent hides the real caret and
-                                // draws its own, leaving a rogue block at the bottom.
+                                auto_copy_term_selection(ui, local, &term_response);
                                 cover_hidden_pty_cursor(
                                     ui,
                                     term_response.rect,
-                                    &session.backend,
+                                    &local.backend,
                                     &term_theme,
                                 );
                                 show_term_scrollbar(
                                     ui,
-                                    &mut session.backend,
+                                    &mut local.backend,
                                     id,
                                     term_size.y,
                                 );
@@ -2054,7 +2220,7 @@ impl App {
                     vidya::dim_label(
                         ui,
                         &theme,
-                        "Resume reopens a past chat from ~/.cursor/chats.",
+                        "Cloud watches remote agents; Resume reopens ~/.cursor/chats.",
                     );
                 });
             });
@@ -2075,7 +2241,8 @@ impl App {
         // Don't steal paste while we're injecting the new-session seed ourselves.
         if self
             .active
-            .and_then(|id| self.sessions.get(&id))
+            .and_then(|id| self.sessions.get_mut(&id))
+            .and_then(|s| s.as_local_mut())
             .is_some_and(|s| s.has_pending_composer_seed())
         {
             return;
@@ -2108,10 +2275,11 @@ impl App {
             return;
         }
 
-        let Some(id) = self.active else {
-            return;
-        };
-        let Some(session) = self.sessions.get_mut(&id) else {
+        let Some(session) = self
+            .active
+            .and_then(|id| self.sessions.get_mut(&id))
+            .and_then(|s| s.as_local_mut())
+        else {
             return;
         };
         if !session.alive {
@@ -2231,6 +2399,342 @@ impl App {
         self.prompt_image_textures
             .insert(path.to_path_buf(), tex.clone());
         Some(tex)
+    }
+
+    fn start_cloud_load(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let load_ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = cloud::resolve_api_key().and_then(|key| cloud::list_agents(&key, 50));
+            let _ = tx.send(result);
+            load_ctx.request_repaint();
+        });
+        self.cloud_load_rx = Some(rx);
+    }
+
+    fn drain_cloud_load(&mut self) {
+        let Some(rx) = &self.cloud_load_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.cloud_load_rx = None;
+        if let Some(dialog) = self.cloud_dialog.as_mut() {
+            dialog.loading = false;
+            dialog.busy = false;
+            match result {
+                Ok(agents) => {
+                    dialog.agents = agents;
+                    dialog.load_error = None;
+                }
+                Err(err) => {
+                    dialog.agents.clear();
+                    dialog.load_error = Some(err);
+                }
+            }
+        }
+    }
+
+    fn drain_cloud_create(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.cloud_create_rx else {
+            return;
+        };
+        let Ok(result) = rx.try_recv() else {
+            return;
+        };
+        self.cloud_create_rx = None;
+        if let Some(dialog) = self.cloud_dialog.as_mut() {
+            dialog.creating = false;
+            dialog.busy = false;
+            match result {
+                Ok(summary) => {
+                    dialog.action_error = None;
+                    dialog.selected = Some(summary.id.clone());
+                    if !dialog
+                        .agents
+                        .iter()
+                        .any(|a| a.id == summary.id)
+                    {
+                        dialog.agents.insert(0, summary.clone());
+                    }
+                    self.watch_cloud_agent(ctx, summary);
+                    self.cloud_dialog = None;
+                }
+                Err(err) => dialog.action_error = Some(err),
+            }
+        }
+    }
+
+    fn watch_cloud_agent(&mut self, ctx: &egui::Context, summary: CloudAgentSummary) {
+        if let Some((id, _)) = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.is_cloud() && s.chat_id() == summary.id)
+        {
+            self.active = Some(*id);
+            return;
+        }
+        let workspace = summary
+            .repo_url
+            .as_deref()
+            .map(cloud::workspace_for_repo)
+            .unwrap_or_else(|| {
+                self.active
+                    .and_then(|id| self.sessions.get(&id))
+                    .map(|s| s.workspace().to_path_buf())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+        let id = self.next_id;
+        self.next_id += 1;
+        self.sessions.insert(
+            id,
+            Session::Cloud(CloudWatch::new(id, summary, workspace)),
+        );
+        self.active = Some(id);
+        ctx.request_repaint();
+    }
+
+    fn show_cloud_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.cloud_dialog.take() else {
+            return;
+        };
+
+        let theme = self.theme.clone();
+        let mut watch = false;
+        let mut create = false;
+        let mut cancel = false;
+        let mut refresh = false;
+        let mut open_web = false;
+        let mut keep_open = true;
+        let filtered: Vec<CloudAgentSummary> = dialog
+            .filtered()
+            .into_iter()
+            .cloned()
+            .collect();
+        let selected = dialog.selected.clone();
+
+        vidya::dialog("Cloud agents", &theme)
+            .id(egui::Id::new("manager_cloud_dialog"))
+            .default_size([460.0, 520.0])
+            .min_width(360.0)
+            .min_height(360.0)
+            .show(ctx, |ui| {
+                vidya::title_2(ui, &theme, "Cursor Cloud Agents");
+                ui.add_space(theme.spacing.xs);
+                vidya::dim_label(
+                    ui,
+                    &theme,
+                    "Set CURSOR_API_KEY (cursor.com/dashboard/api) to list and launch.",
+                );
+                ui.add_space(theme.spacing.sm);
+
+                ui.horizontal(|ui| {
+                    vidya::dim_label(ui, &theme, "Filter");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if vidya::button(ui, &theme, "↻")
+                            .on_hover_text("Refresh")
+                            .clicked()
+                        {
+                            refresh = true;
+                        }
+                        let _ = vidya::text_field_singleline(ui, &theme, &mut dialog.filter);
+                    });
+                });
+                ui.add_space(theme.spacing.xs);
+
+                if dialog.loading {
+                    vidya::dim_label(ui, &theme, "Loading cloud agents…");
+                }
+                if let Some(err) = &dialog.load_error {
+                    ui.colored_label(theme.palette.destructive, err);
+                }
+                if let Some(err) = &dialog.action_error {
+                    ui.colored_label(theme.palette.destructive, err);
+                }
+
+                let footer_reserve = theme.spacing.control_height * 8.0
+                    + theme.spacing.sm * 6.0
+                    + 40.0;
+                let list_h = (ui.available_height() - footer_reserve).max(100.0);
+                egui::ScrollArea::vertical()
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if dialog.loading {
+                            return;
+                        }
+                        if filtered.is_empty() {
+                            vidya::dim_label(ui, &theme, "No cloud agents match.");
+                            return;
+                        }
+                        for agent in &filtered {
+                            let is_sel = selected.as_deref() == Some(agent.id.as_str());
+                            let fill = if is_sel {
+                                theme.palette.accent
+                            } else {
+                                theme.palette.popover_bg
+                            };
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                if is_sel {
+                                    theme.palette.accent
+                                } else {
+                                    theme.palette.border_soft
+                                },
+                            );
+                            let title = egui::RichText::new(&agent.name)
+                                .size(theme.type_scale.body)
+                                .color(if is_sel {
+                                    theme.palette.accent_fg
+                                } else {
+                                    theme.palette.text
+                                });
+                            let meta = format!(
+                                "{} · {}",
+                                agent.status.to_ascii_lowercase(),
+                                agent
+                                    .repo_url
+                                    .as_deref()
+                                    .unwrap_or("(no repo)")
+                            );
+                            let row = egui::Frame::NONE
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(theme.spacing.radius_sm)
+                                .inner_margin(egui::Margin::symmetric(
+                                    theme.spacing.sm as i8,
+                                    theme.spacing.xs as i8,
+                                ))
+                                .show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    ui.label(title);
+                                    vidya::dim_label(ui, &theme, &meta);
+                                });
+                            if row.response.clicked() {
+                                dialog.selected = Some(agent.id.clone());
+                            }
+                        }
+                    });
+
+                ui.add_space(theme.spacing.sm);
+                vidya::title_2(ui, &theme, "Launch new");
+                ui.add_space(theme.spacing.xs);
+                vidya::dim_label(ui, &theme, "Workspace (local path)");
+                vidya::text_field_singleline(ui, &theme, &mut dialog.workspace);
+                ui.add_space(theme.spacing.xs);
+                vidya::dim_label(ui, &theme, "Repository URL");
+                vidya::text_field_singleline(ui, &theme, &mut dialog.repo_url);
+                ui.add_space(theme.spacing.xs);
+                vidya::dim_label(ui, &theme, "Prompt");
+                vidya::text_field_multiline(ui, &theme, &mut dialog.prompt, 3);
+                ui.add_space(theme.spacing.xs);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        vidya::dim_label(ui, &theme, "Model (optional)");
+                        vidya::text_field_singleline(ui, &theme, &mut dialog.model);
+                    });
+                    ui.add_space(theme.spacing.md);
+                    ui.vertical(|ui| {
+                        vidya::dim_label(ui, &theme, "Name (optional)");
+                        vidya::text_field_singleline(ui, &theme, &mut dialog.name);
+                    });
+                });
+
+                ui.add_space(theme.spacing.md);
+                ui.horizontal(|ui| {
+                    let busy = dialog.busy;
+                    let can_watch = dialog.selected.is_some() && !dialog.loading && !busy;
+                    ui.add_enabled_ui(can_watch, |ui| {
+                        if vidya::primary_button(
+                            ui,
+                            &theme,
+                            if busy { "Working…" } else { "Watch" },
+                        )
+                        .clicked()
+                        {
+                            watch = true;
+                        }
+                    });
+                    ui.add_enabled_ui(!busy && !dialog.prompt.trim().is_empty(), |ui| {
+                        if vidya::button(ui, &theme, if dialog.creating { "Launching…" } else { "Launch" })
+                            .clicked()
+                        {
+                            create = true;
+                        }
+                    });
+                    if vidya::button(ui, &theme, "Open web").clicked() {
+                        open_web = true;
+                    }
+                    if vidya::button(ui, &theme, "Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel {
+            keep_open = false;
+            self.cloud_load_rx = None;
+            self.cloud_create_rx = None;
+        }
+        if refresh {
+            dialog.loading = true;
+            dialog.load_error = None;
+            dialog.action_error = None;
+            self.cloud_dialog = Some(dialog);
+            self.start_cloud_load(ctx);
+            return;
+        }
+        if open_web {
+            if let Some(agent) = dialog.selected_agent() {
+                ctx.open_url(egui::OpenUrl::new_tab(&agent.url));
+            }
+        }
+        if watch {
+            if let Some(agent) = dialog.selected_agent().cloned() {
+                self.watch_cloud_agent(ctx, agent);
+                self.cloud_dialog = None;
+                return;
+            }
+        }
+        if create {
+            let workspace = dialog.workspace.clone();
+            let repo_url = if dialog.repo_url.trim().is_empty() {
+                cloud::git_remote_url(Path::new(&workspace)).unwrap_or_default()
+            } else {
+                dialog.repo_url.clone()
+            };
+            let prompt = dialog.prompt.clone();
+            let model = dialog.model.clone();
+            let name = dialog.name.clone();
+            dialog.repo_url = repo_url.clone();
+            dialog.creating = true;
+            dialog.busy = true;
+            dialog.action_error = None;
+            let (tx, rx) = mpsc::channel();
+            let create_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let result = cloud::resolve_api_key().and_then(|key| {
+                    cloud::create_agent(
+                        &key,
+                        &repo_url,
+                        None,
+                        &prompt,
+                        Some(&model).filter(|m| !m.trim().is_empty()).map(|s| s.as_str()),
+                        Some(&name).filter(|n| !n.trim().is_empty()).map(|s| s.as_str()),
+                    )
+                });
+                let _ = tx.send(result);
+                create_ctx.request_repaint();
+            });
+            self.cloud_create_rx = Some(rx);
+            self.cloud_dialog = Some(dialog);
+            return;
+        }
+        if keep_open {
+            self.cloud_dialog = Some(dialog);
+        }
     }
 
     fn show_auth_dialog(&mut self, ctx: &egui::Context) {
@@ -2389,6 +2893,8 @@ impl eframe::App for App {
 
         self.poll_pty_events(ctx);
         self.drain_resume_load();
+        self.drain_cloud_load();
+        self.drain_cloud_create(ctx);
         self.drain_pending_spawn(ctx);
         self.drain_convert();
         self.poll_subagents(ctx);
@@ -2401,6 +2907,7 @@ impl eframe::App for App {
         self.show_central(ctx);
         self.show_new_dialog(ctx);
         self.show_resume_dialog(ctx);
+        self.show_cloud_dialog(ctx);
         self.show_rename_dialog(ctx);
         self.show_convert_dialog(ctx);
         self.show_auth_dialog(ctx);
@@ -2501,8 +3008,9 @@ fn first_line_preview(s: &str, max: usize) -> String {
 }
 
 /// Session story above the terminal — casual narrator prose about the whole turn.
-fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &crate::session::AgentSession) {
-    let summary = session.summary.as_ref().filter(|s| !s.is_empty());
+fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &Session) {
+    let summary = session.summary().filter(|s| !s.is_empty());
+    let cloud_text = session.cloud_summary_text();
     let muted = mix_rgb(theme.palette.text_secondary, theme.palette.text, 0.45);
     let max_h = (ui.available_height() * 0.28).clamp(72.0, 160.0);
 
@@ -2517,12 +3025,17 @@ fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &crate::session
             ui.set_min_width(ui.available_width());
             ui.set_max_height(max_h);
 
-            let prose = match summary {
-                Some(summary) if !summary.prose.trim().is_empty() => summary.prose.as_str(),
-                _ if session.alive => "quiet so far — nothing cooking yet.",
-                _ => "nothing happened in this session.",
+            let prose = if let Some(text) = cloud_text.filter(|t| !t.trim().is_empty()) {
+                text
+            } else {
+                match summary {
+                    Some(summary) if !summary.prose.trim().is_empty() => summary.prose.as_str(),
+                    _ if session.alive() => "quiet so far — nothing cooking yet.",
+                    _ => "nothing happened in this session.",
+                }
             };
-            let empty = summary.is_none_or(|s| s.prose.trim().is_empty());
+            let empty = cloud_text.is_none_or(|t| t.trim().is_empty())
+                && summary.is_none_or(|s| s.prose.trim().is_empty());
             let color = if empty { muted } else { theme.palette.text };
             let job = summary_markdown_job(prose, theme, color, empty);
 
@@ -2533,6 +3046,58 @@ fn show_summary_panel(ui: &mut egui::Ui, theme: &Theme, session: &crate::session
                     ui.set_min_width(ui.available_width());
                     ui.add(egui::Label::new(job).wrap());
                 });
+        });
+}
+
+fn show_cloud_panel(ui: &mut egui::Ui, theme: &Theme, session: &mut Session) {
+    let Session::Cloud(cloud) = session else {
+        return;
+    };
+    ui.add_space(theme.spacing.sm);
+    egui::Frame::NONE
+        .fill(theme.palette.card_bg)
+        .stroke(egui::Stroke::new(1.0, theme.palette.border_soft))
+        .inner_margin(egui::Margin::symmetric(
+            theme.spacing.lg as i8,
+            theme.spacing.md as i8,
+        ))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            vidya::title_2(ui, theme, "Cloud agent");
+            ui.add_space(theme.spacing.sm);
+            if cloud.has_activity() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(theme.type_scale.body));
+                    vidya::dim_label(
+                        ui,
+                        theme,
+                        cloud.activity.as_deref().unwrap_or("Running…"),
+                    );
+                });
+            } else {
+                vidya::dim_label(ui, theme, "Remote agent — no local terminal.");
+            }
+            ui.add_space(theme.spacing.sm);
+            vidya::dim_label(ui, theme, &format!("Agent {}", cloud.bc_id));
+            if let Some(repo) = &cloud.repo_url {
+                vidya::dim_label(ui, theme, repo);
+            }
+            if let Some(branch) = &cloud.branch {
+                vidya::dim_label(ui, theme, &format!("Branch: {branch}"));
+            }
+            if let Some(pr) = &cloud.pr_url {
+                if ui.link(pr).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(pr));
+                }
+            }
+            ui.add_space(theme.spacing.md);
+            if ui
+                .button("Open in browser")
+                .on_hover_text(&cloud.url)
+                .clicked()
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&cloud.url));
+            }
         });
 }
 
@@ -2841,6 +3406,55 @@ fn chat_poller_loop(
             let snap = subagents::poll_chat(chat_id, Some(workspace.as_path()));
             if snap_tx.send((*id, snap)).is_err() {
                 return;
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
+fn cloud_poller_loop(
+    watch_rx: Receiver<Vec<CloudWatchEntry>>,
+    snap_tx: Sender<(u64, cloud::CloudAgentDetail, Option<cloud::CloudRunSnapshot>)>,
+    ctx: egui::Context,
+) {
+    let mut watches: Vec<CloudWatchEntry> = Vec::new();
+    let mut api_key: Option<String> = None;
+    loop {
+        if watches.is_empty() {
+            match watch_rx.recv() {
+                Ok(next) => watches = next,
+                Err(_) => return,
+            }
+        } else {
+            match watch_rx.recv_timeout(CLOUD_POLL_INTERVAL) {
+                Ok(next) => watches = next,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        while let Ok(next) = watch_rx.try_recv() {
+            watches = next;
+        }
+        if watches.is_empty() {
+            continue;
+        }
+
+        if api_key.is_none() {
+            api_key = cloud::resolve_api_key().ok();
+        }
+        let Some(key) = api_key.as_deref() else {
+            ctx.request_repaint_after(CLOUD_POLL_INTERVAL);
+            continue;
+        };
+
+        for (id, bc_id) in &watches {
+            match cloud::poll_agent(key, bc_id) {
+                Ok((detail, run)) => {
+                    if snap_tx.send((*id, detail, run)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {}
             }
         }
         ctx.request_repaint();

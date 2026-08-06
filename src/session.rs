@@ -466,6 +466,135 @@ impl AgentSession {
     }
 }
 
+/// Local PTY session or a watch-only cloud agent tab.
+pub enum Session {
+    Local(AgentSession),
+    Cloud(crate::cloud::CloudWatch),
+}
+
+impl Session {
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Local(s) => s.id,
+            Self::Cloud(s) => s.id,
+        }
+    }
+
+    pub fn is_cloud(&self) -> bool {
+        matches!(self, Self::Cloud(_))
+    }
+
+    pub fn title(&self) -> &str {
+        match self {
+            Self::Local(s) => &s.title,
+            Self::Cloud(s) => &s.title,
+        }
+    }
+
+    pub fn workspace(&self) -> &Path {
+        match self {
+            Self::Local(s) => &s.workspace,
+            Self::Cloud(s) => &s.workspace,
+        }
+    }
+
+    pub fn alive(&self) -> bool {
+        match self {
+            Self::Local(s) => s.alive,
+            Self::Cloud(s) => s.alive(),
+        }
+    }
+
+    pub fn chat_id(&self) -> &str {
+        match self {
+            Self::Local(s) => &s.chat_id,
+            Self::Cloud(s) => &s.bc_id,
+        }
+    }
+
+    pub fn needs_input(&self) -> bool {
+        match self {
+            Self::Local(s) => s.needs_input(),
+            Self::Cloud(_) => false,
+        }
+    }
+
+    pub fn has_activity(&self) -> bool {
+        match self {
+            Self::Local(s) => s.has_activity(),
+            Self::Cloud(s) => s.has_activity(),
+        }
+    }
+
+    pub fn activity(&self) -> Option<&str> {
+        match self {
+            Self::Local(s) => s.activity.as_deref(),
+            Self::Cloud(s) => s.activity.as_deref(),
+        }
+    }
+
+    pub fn subagents(&self) -> &[Subagent] {
+        match self {
+            Self::Local(s) => &s.subagents,
+            Self::Cloud(_) => &[],
+        }
+    }
+
+    pub fn tasks_folded(&self) -> bool {
+        match self {
+            Self::Local(s) => s.tasks_folded,
+            Self::Cloud(_) => true,
+        }
+    }
+
+    pub fn toggle_tasks_folded(&mut self) {
+        if let Self::Local(s) = self {
+            s.tasks_folded = !s.tasks_folded;
+        }
+    }
+
+    pub fn as_local_mut(&mut self) -> Option<&mut AgentSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Cloud(_) => None,
+        }
+    }
+
+    pub fn as_cloud_mut(&mut self) -> Option<&mut crate::cloud::CloudWatch> {
+        match self {
+            Self::Cloud(s) => Some(s),
+            Self::Local(_) => None,
+        }
+    }
+
+    pub fn set_user_title(&mut self, title: impl Into<String>) {
+        match self {
+            Self::Local(s) => s.set_user_title(title),
+            Self::Cloud(s) => s.set_user_title(title),
+        }
+    }
+
+    pub fn auto_rename_from_content(&mut self) {
+        if let Some(s) = self.as_local_mut() {
+            s.auto_rename_from_content();
+        }
+    }
+
+    pub fn summary(&self) -> Option<&SessionSummary> {
+        match self {
+            Self::Local(s) => s.summary.as_ref(),
+            Self::Cloud(_) => None,
+        }
+    }
+
+    pub fn cloud_summary_text(&self) -> Option<&str> {
+        match self {
+            Self::Cloud(s) => s.summary.as_deref(),
+            Self::Local(_) => None,
+        }
+    }
+}
+
 /// Prefer poller state (meta title, then summary); fall back to terminal text.
 ///
 /// Does not scan `~/.cursor/chats` on the UI thread — that data arrives via
