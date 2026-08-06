@@ -26,6 +26,7 @@ usage() {
 Usage: docker-android.sh <command>
 
 Commands:
+  up        rm stopped container, start, wait for boot (one-shot)
   start     Run emulator container (idempotent)
   wait      Wait until emulator is booted (needs adb on PATH)
   stop      Stop container
@@ -164,6 +165,16 @@ cmd_start() {
   echo "Boot status:  docker exec $CONTAINER cat device_status" >&2
 }
 
+cmd_up() {
+  need_docker
+  if container_exists && ! container_running; then
+    echo "→ removing stopped $CONTAINER" >&2
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+  cmd_start
+  cmd_wait
+}
+
 cmd_wait() {
   need_docker
   if ! container_running; then
@@ -237,6 +248,7 @@ cmd_logs() {
 main() {
   local cmd="${1:-}"
   case "$cmd" in
+    up) cmd_up ;;
     start) cmd_start ;;
     wait) cmd_wait ;;
     stop) cmd_stop ;;
