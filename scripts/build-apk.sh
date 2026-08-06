@@ -57,8 +57,8 @@ done
 export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$HOME/.local/share/android-ndk-r29}"
 export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/.local/share/android-sdk}"
+# Prefer ANDROID_HOME; cargo-apk can get confused when both are set differently.
 unset ANDROID_SDK_ROOT 2>/dev/null || true
-export PATH="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin:${ANDROID_HOME}/platform-tools:${HOME}/.cargo/bin:${PATH}"
 
 need() { command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
 need cargo
@@ -67,8 +67,23 @@ need rustc
 
 [[ -d "$ANDROID_NDK_HOME" ]] || {
   echo "Set ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >&2
+  echo "  (nix develop / nix run .#apk provide a hermetic SDK+NDK)" >&2
   exit 1
 }
+
+# NDK llvm prebuilt host triple (linux-x86_64 on most desktops; aarch64 hosts differ).
+prebuilt=""
+for host in linux-x86_64 linux-aarch64; do
+  if [[ -d "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin" ]]; then
+    prebuilt="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$host/bin"
+    break
+  fi
+done
+[[ -n "$prebuilt" ]] || {
+  echo "NDK llvm prebuilt toolchain not found under $ANDROID_NDK_HOME" >&2
+  exit 1
+}
+export PATH="${prebuilt}:${ANDROID_HOME}/platform-tools:${HOME}/.cargo/bin:${PATH}"
 
 # Map target → clang triple helpers used by cargo-apk / cc crate.
 case "$TARGET" in

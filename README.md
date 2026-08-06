@@ -49,18 +49,18 @@ Shell package (`uk.nandi.manager`) for phone / Waydroid install smoke tests. Ful
 nix develop
 just apk-release          # aarch64 release → android/target/release/apk/manager.apk
 just apk-release-x86      # x86_64 (Waydroid)
-./scripts/build-apk.sh --release --target aarch64-linux-android
+nix run .#apk -- --release --target aarch64-linux-android
 ```
 
-Needs Android NDK (`ANDROID_NDK_HOME`, default `~/.local/share/android-ndk-r29`), `cargo-apk`, and `rustup target add aarch64-linux-android` (and/or `x86_64-linux-android`).
+`nix develop` / `nix run .#apk` provide a hermetic Android SDK+NDK, `cargo-apk`, JDK (`keytool`), and a rust-overlay toolchain with `aarch64-linux-android` / `x86_64-linux-android` targets. Override `ANDROID_HOME` / `ANDROID_NDK_HOME` if you prefer a host install.
 
 ## Requirements
 
-- Rust toolchain
-- `cursor-agent` on `PATH` (or set `CURSOR_AGENT` to an executable path; Cursor’s in-session `CURSOR_AGENT=1` flag is ignored)
+- Rust toolchain (provided by `nix develop`)
+- `cursor-agent` on `PATH` (flake wraps it in; or set `CURSOR_AGENT` to an executable path; Cursor’s in-session `CURSOR_AGENT=1` flag is ignored)
 - `CURSOR_API_KEY` for **Cloud** (API key from [cursor.com/dashboard/api](https://cursor.com/dashboard/api))
 - Linux (Wayland or X11)
-- `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste
+- `wl-paste` / `wl-copy` (Wayland) or `xclip` (X11) on `PATH` for clipboard image paste (also in the flake)
 
 ### Cursor API key (OIDC)
 
@@ -87,11 +87,15 @@ On success the OpenBao token is saved to `~/.bao-token` and `CURSOR_API_KEY` is 
 | `apps.default` / `apps.desktop` | Devshell: cargo build + `gtk-launch` `.desktop` (icon) |
 | `apps.manager` | Devshell: cargo build + run binary only |
 | `apps.build` | Devshell: `cargo build --release` only |
+| `apps.apk` | Hermetic cargo-apk build (`--release`, `--target`, …) |
+| `apps.cursor-agent` | Run the packaged Cursor agent CLI |
 | `apps.package` | Pure store binary |
 | `apps.package-desktop` | Pure package via its `.desktop` |
-| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons |
+| `packages.default` / `packages.manager` | Binary + `.desktop` + hicolor icons (PATH includes cursor-agent + clipboard tools) |
 | `packages.desktop` | Wrapper that launches the packaged `.desktop` |
-| `devShells.default` | rustc + cargo + egui runtime libs |
+| `packages.cursor-agent` | Cursor agent CLI (from [nix-ai-tools](https://github.com/numtide/nix-ai-tools)) |
+| `packages.android-sdk` | Hermetic Android SDK+NDK used by APK builds |
+| `devShells.default` | rust (android targets) + cargo-apk + SDK/NDK + cursor-agent + clipboard |
 | `assets/manager.svg` | App icon source |
 
 Apps need a live checkout next to `../vidya`. The packaged `packages.manager` stages flake input `vidya` for pure builds.

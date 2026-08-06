@@ -1,7 +1,8 @@
 # Agent Manager
-#   nix develop
-#   just apk-release          # phone aarch64 release APK
-#   just apk-release-x86      # Waydroid x86_64 release APK
+#   nix develop                 # SDK/NDK + cargo-apk + cursor-agent
+#   just apk-release            # phone aarch64 release APK
+#   just apk-release-x86        # Waydroid x86_64 release APK
+#   nix run .#apk -- --release  # same hermetic toolchain without enter shell
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
@@ -15,7 +16,7 @@ run:
 build:
     nix run .#build
 
-# Android APK via cargo-apk (needs NDK + rustup android target)
+# Android APK via cargo-apk (flake SDK/NDK + rust-overlay android targets)
 apk *args:
     ./scripts/build-apk.sh {{args}}
 
