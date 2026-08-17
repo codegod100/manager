@@ -1007,10 +1007,58 @@ impl App {
                             open_convert = true;
                             ui.close_menu();
                         }
+                        if ui.button("About").clicked() {
+                            ui.ctx()
+                                .memory_mut(|m| {
+                                    m.data.insert_temp(egui::Id::new("about_open"), true)
+                                });
+                            ui.close_menu();
+                        }
                     });
                 });
             });
         });
+
+        let mut about_open = ctx
+            .memory(|m| m.data.get_temp::<bool>(egui::Id::new("about_open")))
+            .unwrap_or(false);
+        if about_open {
+            egui::Window::new("About")
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(theme.spacing.sm);
+                    vidya::title(ui, &theme, "Agent Manager");
+                    ui.add_space(theme.spacing.xs);
+                    vidya::dim_label(
+                        ui,
+                        &theme,
+                        concat!("Version ", env!("CARGO_PKG_VERSION")),
+                    );
+                    ui.add_space(theme.spacing.sm);
+                    vidya::body(
+                        ui,
+                        &theme,
+                        "Multi-instance prime-agent GUI (vidya + egui_term).",
+                    );
+                    ui.add_space(theme.spacing.sm);
+                    vidya::body(ui, &theme, "MIT License");
+                    ui.add_space(theme.spacing.sm);
+                    ui.label(
+                        egui::RichText::new("nandi.uk/manager")
+                            .size(theme.type_scale.caption)
+                            .color(theme.palette.text_secondary),
+                    );
+                    ui.add_space(theme.spacing.md);
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            about_open = false;
+                        }
+                    });
+                });
+        }
+        ctx.memory_mut(|m| m.data.insert_temp(egui::Id::new("about_open"), about_open));
 
         if open_new {
             let mut draft = NewSessionDraft::default();
