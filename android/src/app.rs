@@ -10,6 +10,8 @@ use vidya::{
 };
 
 const APP_TITLE: &str = "Agent Manager";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_REPO: &str = "nandi.uk/manager";
 
 /// Desktop smoke-test entry (`cargo run --manifest-path android/Cargo.toml` is
 /// not wired; use the root crate). Kept so the lib type-checks off-Android.
@@ -44,6 +46,7 @@ pub fn run_android(android_app: winit::platform::android::activity::AndroidApp) 
 
 struct ManagerShell {
     theme: Theme,
+    about_open: bool,
 }
 
 impl ManagerShell {
@@ -51,7 +54,10 @@ impl ManagerShell {
         apply_dark(&cc.egui_ctx);
         let mut theme = Theme::dark();
         theme.type_scale.caption = 13.0;
-        Self { theme }
+        Self {
+            theme,
+            about_open: false,
+        }
     }
 }
 
@@ -60,6 +66,42 @@ impl eframe::App for ManagerShell {
         apply_dark(ctx);
         reserve_system_chrome(ctx, &self.theme);
 
+        if self.about_open {
+            egui::Window::new("About")
+                .open(&mut self.about_open)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(self.theme.spacing.sm);
+                    title(ui, &self.theme, APP_TITLE);
+                    ui.add_space(self.theme.spacing.xs);
+                    dim_label(ui, &self.theme, &format!("Version {APP_VERSION}"));
+                    ui.add_space(self.theme.spacing.sm);
+                    body(
+                        ui,
+                        &self.theme,
+                        "Multi-instance prime-agent GUI (vidya + egui_term).\n\
+                         Desktop sessions embed live prime-agent PTYs; this APK is a \
+                         branded install / Waydroid smoke-test shell.",
+                    );
+                    ui.add_space(self.theme.spacing.sm);
+                    body(ui, &self.theme, "MIT License");
+                    ui.add_space(self.theme.spacing.sm);
+                    ui.label(
+                        RichText::new(APP_REPO)
+                            .size(self.theme.type_scale.caption)
+                            .color(self.theme.palette.text_secondary),
+                    );
+                    ui.add_space(self.theme.spacing.md);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if primary_button(ui, &self.theme, "Close").clicked() {
+                            self.about_open = false;
+                        }
+                    });
+                });
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(self.theme.palette.window_bg))
             .show(ctx, |ui| {
@@ -67,6 +109,12 @@ impl eframe::App for ManagerShell {
                 ui.horizontal(|ui| {
                     ui.add_space(self.theme.spacing.md);
                     title(ui, &self.theme, APP_TITLE);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add_space(self.theme.spacing.md);
+                        if ui.button("About").clicked() {
+                            self.about_open = true;
+                        }
+                    });
                 });
                 ui.add_space(self.theme.spacing.sm);
                 ui.horizontal(|ui| {
@@ -125,7 +173,7 @@ impl eframe::App for ManagerShell {
 
                                 ui.add_space(self.theme.spacing.xl);
                                 ui.label(
-                                    RichText::new("nandi.uk/manager")
+                                    RichText::new(APP_REPO)
                                         .size(self.theme.type_scale.caption)
                                         .color(self.theme.palette.text_secondary),
                                 );
