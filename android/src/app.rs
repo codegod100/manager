@@ -68,7 +68,6 @@ impl eframe::App for ManagerShell {
 
         if self.about_open {
             egui::Window::new("About")
-                .open(&mut self.about_open)
                 .resizable(false)
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
